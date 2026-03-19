@@ -175,6 +175,10 @@ def probe_continuous_input(
 
     Run BEFORE full training to validate the pre-encoder design assumption.
 
+    Constructs an identity T (K=0 probe) so that the augmented view is
+    identical to the original, then checks that the resulting loss matches
+    the original loss closely.
+
     Args:
         recommender: SASRec model
         input_ids:   [B, L] batch of real item ids
@@ -198,24 +202,18 @@ def probe_continuous_input(
         target_neg=target_neg,
     )
 
-    # Construct a simple fixed T (identity + next-shift blend)
-    S = recommender.item_embeddings(input_ids)  # [B, L, D]
-    eye = torch.eye(L, device=device).unsqueeze(0).expand(B, -1, -1)
-    # Shift matrix: each position i attends to position i+1
-    shift = torch.zeros(L, L, device=device)
-    if L > 1:
-        shift[torch.arange(L - 1), torch.arange(1, L)] = 1.0
-        shift[-1, -1] = 1.0  # last position stays
-    shift = shift.unsqueeze(0).expand(B, -1, -1)
+    # Identity T of shape [B, P, L] where P = L (K=0 for probe).
+    # Column j gets all weight on pool row j → identity mapping.
+    T_probe = torch.eye(L, device=device).unsqueeze(0).expand(B, -1, -1)  # [B, L, L]
+    lam_probe = torch.full((B, 1), 0.5, device=device)
 
-    T_simple = eye * 0.7 + shift * 0.3
-    aug_emb = torch.bmm(T_simple, S)  # [B, L, D]
-
-    repr_aug, aug_loss = recommender(
-        inputs_embeds=aug_emb,
-        target_pos=target_pos,
-        target_neg=target_neg,
+    repr_aug = recommender.get_mixed_representation(
+        input_ids=input_ids,
+        T=T_probe,
+        pool_ids=input_ids,
+        lam=lam_probe,
     )
+    aug_loss = recommender.rec_loss(repr_aug, target_pos, target_neg)
 
     orig_val = orig_loss.item()
     aug_val = aug_loss.item()

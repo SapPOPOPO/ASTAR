@@ -57,23 +57,24 @@ def visualize_T(
     K = augmenter.K
     pool_size = (1 + K) * L
 
-    T_accum = torch.zeros(L, pool_size)
+    T_accum = torch.zeros(pool_size, L)
     count = 0
 
     for i, batch in enumerate(dataloader):
         if i >= max_batches:
             break
         input_ids = batch["input_ids"].to(device)
-        _, T, _ = augmenter(input_ids, lambda_ceiling=lambda_ceiling)
-        T_accum += T.cpu().mean(0)  # average over batch
+        T, _, _ = augmenter(input_ids, lambda_ceiling=lambda_ceiling)
+        T_accum += T.cpu().mean(0)  # average over batch → [P, L]
         count += 1
 
-    T_avg = T_accum / max(count, 1)  # [L, (1+K)*L]
+    T_avg = T_accum / max(count, 1)  # [P, L] where P = (1+K)*L
 
-    T_intra = T_avg[:, :L].numpy()  # [L, L]
-    T_inter = T_avg[:, L:].numpy()  # [L, K*L]
-    inter_per_pos = T_inter.mean(axis=1)  # [L]  mean weight to inter-sequences
-    intra_per_pos = T_intra.sum(axis=1)   # [L]  total weight on own sequence
+    T_intra = T_avg[:L, :].numpy()   # [L, L]  own-sequence pool rows
+    T_inter = T_avg[L:, :].numpy()   # [K*L, L]
+    # Per output position: total weight from intra / inter pool rows
+    intra_per_pos = T_intra.sum(axis=0)   # [L]
+    inter_per_pos = T_inter.sum(axis=0)   # [L]
 
     fig = plt.figure(figsize=(14, 6))
     gs = gridspec.GridSpec(1, 3, figure=fig, width_ratios=[3, 1, 1])
@@ -82,8 +83,8 @@ def visualize_T(
     ax0 = fig.add_subplot(gs[0])
     im = ax0.imshow(T_intra, aspect="auto", cmap="hot", vmin=0)
     ax0.set_title("T_intra: Own-sequence attention")
-    ax0.set_xlabel("Source position j")
-    ax0.set_ylabel("Target position i")
+    ax0.set_xlabel("Output position j")
+    ax0.set_ylabel("Pool source position p")
     plt.colorbar(im, ax=ax0)
 
     # ── Intra vs inter per position ──────────────────────────────────────
@@ -277,9 +278,11 @@ def compute_intra_inter_ratio(
             break
         input_ids = batch["input_ids"].to(device)
         _, T, _ = augmenter(input_ids, lambda_ceiling=lambda_ceiling)
-        # T: [B, L, (1+K)*L]
-        intra_weight = T[:, :, :L].sum(dim=-1).mean().item()
-        inter_weight = T[:, :, L:].sum(dim=-1).mean().item()
+        # T: [B, P, L] where P = (1+K)*L
+        # intra rows: T[:, :L, :], inter rows: T[:, L:, :]
+        # Sum over pool rows to get per-output-position weight
+        intra_weight = T[:, :L, :].sum(dim=1).mean().item()
+        inter_weight = T[:, L:, :].sum(dim=1).mean().item()
         intra_total += intra_weight
         inter_total += inter_weight
         count += 1

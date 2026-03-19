@@ -5,7 +5,14 @@ Implements:
     - Unified intra + inter sequence transformation matrix T
     - Adaptive blend weight λ
     - Masked softmax over real (non-padding) pool positions
-    - Own item embeddings (independent from recommender)
+    - Own item embeddings (used for context encoding only, not for output)
+
+T shape: [B, P, L] where P = (1+K)*L
+    - rows = pool positions (source), columns = output positions (target)
+    - softmax over dim=1 (each column sums to 1)
+
+forward() returns: T [B, P, L], pool_ids [B, P], lam [B, 1]
+    Embedding lookup and λ-blending happen inside the recommender.
 """
 
 from typing import Optional, Tuple
@@ -25,6 +32,10 @@ class ASTARAugmenter(nn.Module):
         L  – sequence length
         D  – hidden dimension
         K  – number of inter-sequence samples per example
+        P  – pool size = (1+K)*L
+
+    forward() returns T [B, P, L], pool_ids [B, P], lam [B, 1].
+    Embedding lookup and λ-blending are delegated to the recommender.
     """
 
     def __init__(
@@ -50,8 +61,7 @@ class ASTARAugmenter(nn.Module):
         self.tau_floor = tau_floor
         self.tau_decay = tau_decay
 
-        # ── Own item embeddings (NOT shared with recommender) ───────────────
-        # Initialised from recommender embeddings before training starts.
+        # ── Own item embeddings (for context encoding only, not for output) ──
         self.item_embeddings = nn.Embedding(num_items + 1, hidden_size, padding_idx=0)
         self.position_embeddings = nn.Embedding(max_seq_len, hidden_size)
         self.emb_dropout = nn.Dropout(dropout)
@@ -61,7 +71,7 @@ class ASTARAugmenter(nn.Module):
         self.encoder = Encoder(hidden_size, num_heads, num_layers, inner_size, dropout)
         self.enc_norm = LayerNorm(hidden_size)
 
-        # ── T head: [B, L, D] → [B, L, (1+K)*L] ────────────────────────────
+        # ── T head: h [B, L, D] → logits [B, L, P], transposed to [B, P, L] ─
         pool_size = (1 + K) * max_seq_len
         self.T_head = nn.Linear(hidden_size, pool_size, bias=True)
 
@@ -76,6 +86,10 @@ class ASTARAugmenter(nn.Module):
         self.LAMBDA_RANGE: float = 0.3
         self.LAMBDA_NOISE_SCALE: float = 0.1
 
+        # Stores T_logits [B, P, L] from the most recent forward pass so the
+        # trainer can apply hard Gumbel ST without re-running the augmenter.
+        self._last_T_logits: Optional[torch.Tensor] = None
+
         self._init_weights()
 
     # ── initialisation ───────────────────────────────────────────────────────
@@ -86,13 +100,6 @@ class ASTARAugmenter(nn.Module):
                 module.weight.data.normal_(mean=0.0, std=0.02)
             if isinstance(module, nn.Linear) and module.bias is not None:
                 module.bias.data.zero_()
-
-    def copy_embeddings_from(self, recommender: nn.Module) -> None:
-        """Initialise own embeddings from recommender's item embeddings."""
-        with torch.no_grad():
-            self.item_embeddings.weight.copy_(
-                recommender.item_embeddings.weight
-            )
 
     # ── temperature schedule ─────────────────────────────────────────────────
 
@@ -123,12 +130,11 @@ class ASTARAugmenter(nn.Module):
 
     def _sample_inter_sequences(
         self, input_ids: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """Sample K other sequences from the batch for inter-sequence mixing.
 
         Returns:
-            sampled_ids:  [B, K*L]  item ids of sampled sequences
-            sampled_emb:  [B, K*L, D]  their item embeddings
+            sampled_ids: [B, K*L]  item ids of sampled sequences
         """
         B, L = input_ids.shape
         K = self.K
@@ -156,30 +162,32 @@ class ASTARAugmenter(nn.Module):
             sampled_ids_list.append(chosen_seqs.view(-1))  # [K*L]
 
         sampled_ids = torch.stack(sampled_ids_list, dim=0)  # [B, K*L]
-        sampled_emb = self.item_embeddings(sampled_ids)  # [B, K*L, D]
-        return sampled_ids, sampled_emb
+        return sampled_ids
 
     def _masked_softmax(
         self,
         T_logits: torch.Tensor,
         pool_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Apply mask then softmax along last dimension.
+        """Apply mask then softmax over pool dimension (dim=1).
 
         Args:
-            T_logits:  [B, L, pool_size]
-            pool_mask: [B, pool_size]   1 for real tokens, 0 for padding
+            T_logits:  [B, P, L]  — pool positions × output positions
+            pool_mask: [B, P]     1 for real pool tokens, 0 for padding
         Returns:
-            T: [B, L, pool_size]
+            T: [B, P, L]  (each column sums to 1 over pool dim=1)
         """
-        # Expand mask for broadcasting over L positions
-        mask = pool_mask.unsqueeze(1).expand_as(T_logits)  # [B, L, pool_size]
+        # Expand mask for broadcasting over L output positions
+        mask = pool_mask.unsqueeze(-1).expand_as(T_logits)  # [B, P, L]
         T_logits = T_logits.masked_fill(~mask.bool(), float("-inf"))
-        T = F.softmax(T_logits / self.tau, dim=-1)
-        # Replace any NaN rows (all-masked) with uniform over pool
-        nan_rows = T.isnan().any(dim=-1, keepdim=True)
-        uniform = torch.ones_like(T) / T.size(-1)
-        T = torch.where(nan_rows, uniform, T)
+        T = F.softmax(T_logits / self.tau, dim=1)
+        # Replace any NaN columns (all-masked pool for a given output position) with
+        # uniform over non-masked pool positions (zero weight on padding positions)
+        nan_cols = T.isnan().any(dim=1, keepdim=True)
+        mask_f = pool_mask.float().unsqueeze(-1).expand_as(T)   # [B, P, L]
+        counts = pool_mask.float().sum(dim=1, keepdim=True).unsqueeze(-1).clamp(min=1)  # [B, 1, 1]
+        uniform = mask_f / counts
+        T = torch.where(nan_cols, uniform, T)
         return T
 
     # ── main augmentation forward ─────────────────────────────────────────────
@@ -189,38 +197,37 @@ class ASTARAugmenter(nn.Module):
         input_ids: torch.Tensor,
         lambda_ceiling: float = 0.8,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Generate adversarially augmented view.
+        """Compute transformation matrix T and blend weight λ.
 
         Args:
             input_ids:       [B, L]  item ids (0 = padding)
             lambda_ceiling:  upper bound for λ (adapted per epoch)
 
         Returns:
-            aug:     [B, L, D]   augmented embedding sequence
-            T:       [B, L, pool_size]  transformation matrix (for viz)
-            lam:     [B, 1]      blend weights
+            T:        [B, P, L]   transformation matrix (softmax over pool dim=1)
+            pool_ids: [B, P]      integer item ids of the full pool
+            lam:      [B, 1]      blend weights
         """
         B, L = input_ids.shape
         K = self.K
 
-        # ── 1. Encode own sequence ───────────────────────────────────────────
-        h, own_mask = self._encode(input_ids)  # [B,L,D], [B,L]
+        # ── 1. Encode own sequence (using augmenter's own embeddings) ────────
+        h, own_mask = self._encode(input_ids)  # [B, L, D], [B, L]
 
-        # ── 2. Build pool: own sequence + K sampled sequences ────────────────
-        S_intra = self.item_embeddings(input_ids)  # [B, L, D]
-        sampled_ids, S_others = self._sample_inter_sequences(input_ids)
-        # [B, (1+K)*L, D]
-        S_pool = torch.cat([S_intra, S_others], dim=1)
+        # ── 2. Build pool_ids: own sequence + K sampled sequences ────────────
+        sampled_ids = self._sample_inter_sequences(input_ids)  # [B, K*L]
+        pool_ids = torch.cat([input_ids, sampled_ids], dim=1)  # [B, (1+K)*L]
 
         others_mask = (sampled_ids > 0).long()  # [B, K*L]
         pool_mask = torch.cat([own_mask, others_mask], dim=1)  # [B, (1+K)*L]
 
-        # ── 3. Compute T logits ──────────────────────────────────────────────
-        T_logits = self.T_head(h)  # [B, L, (1+K)*L]
-        T = self._masked_softmax(T_logits, pool_mask)  # [B, L, (1+K)*L]
+        # ── 3. Compute T logits and store for hard Gumbel ST in trainer ──────
+        # T_head maps [B, L, D] → [B, L, P], then transpose to [B, P, L]
+        T_logits = self.T_head(h).transpose(1, 2)  # [B, P, L]
+        self._last_T_logits = T_logits  # stored for Phase 1 hard Gumbel ST
 
-        # ── 4. Apply T to pool ───────────────────────────────────────────────
-        T_S = torch.bmm(T, S_pool)  # [B, L, D]
+        # ── 4. Masked softmax over pool dim=1 ────────────────────────────────
+        T = self._masked_softmax(T_logits, pool_mask)  # [B, P, L]
 
         # ── 5. Compute λ ─────────────────────────────────────────────────────
         seq_lengths = own_mask.sum(dim=1).float()  # [B]
@@ -234,11 +241,7 @@ class ASTARAugmenter(nn.Module):
         noise = torch.randn_like(lam) * self.LAMBDA_NOISE_SCALE
         lam = (lam + noise).clamp(self.MIN_LAMBDA, lambda_ceiling)  # [B, 1]
 
-        # ── 6. Blend ──────────────────────────────────────────────────────────
-        lam3 = lam.unsqueeze(2)  # [B, 1, 1] → broadcast over L, D
-        aug = lam3 * T_S + (1.0 - lam3) * S_intra  # [B, L, D]
-
-        return aug, T, lam
+        return T, pool_ids, lam
 
     @staticmethod
     def _mean_pool(h: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
