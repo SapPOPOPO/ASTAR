@@ -173,10 +173,11 @@ def probe_continuous_input(
     """Critical diagnostic: does the recommender accept continuous augmented
     embeddings comparably to discrete ids?
 
-    Run BEFORE full training to validate the mixed-representation design
-    assumption. Uses the new get_mixed_representation() API: constructs a
-    simple T (identity + shift blend) applied to the recommender's own
-    item embeddings, then calls get_mixed_representation.
+    Run BEFORE full training to validate the pre-encoder design assumption.
+
+    Constructs an identity T (K=0 probe) so that the augmented view is
+    identical to the original, then checks that the resulting loss matches
+    the original loss closely.
 
     Args:
         recommender: SASRec model
@@ -201,27 +202,17 @@ def probe_continuous_input(
         target_neg=target_neg,
     )
 
-    # Construct aug_emb via a simple T: identity [B, L, L] as [B, P, L] (P=L,
-    # using own sequence only as pool) blended with a shift.
-    # T_new[p, j]: weight from pool position p to output position j.
-    # Identity T: T_new = eye → aug_emb = org_emb.
-    # Shift T: T_new[p, j] = 1 if p == j+1 (output j draws from pool p=j+1).
-    S = recommender.item_embeddings(input_ids)  # [B, L, D]
+    # Identity T of shape [B, P, L] where P = L (K=0 for probe).
+    # Column j gets all weight on pool row j → identity mapping.
+    T_probe = torch.eye(L, device=device).unsqueeze(0).expand(B, -1, -1)  # [B, L, L]
+    lam_probe = torch.full((B, 1), 0.5, device=device)
 
-    eye = torch.eye(L, device=device).unsqueeze(0).expand(B, -1, -1)  # [B, L, L]
-    # Shift: output position j draws from pool position j+1
-    shift = torch.zeros(L, L, device=device)
-    if L > 1:
-        shift[torch.arange(1, L), torch.arange(L - 1)] = 1.0  # pool[j+1] → output[j]
-        shift[0, 0] = 1.0  # first output position stays
-    shift = shift.unsqueeze(0).expand(B, -1, -1)
-
-    # T_simple [B, P, L] = [B, L, L]
-    T_simple = eye * 0.7 + shift * 0.3
-    aug_emb = torch.einsum("bpj,bpd->bjd", T_simple, S)  # [B, L, D]
-
-    lam = torch.full((B, 1), 0.5, device=device)
-    repr_aug = recommender.get_mixed_representation(input_ids, aug_emb, lam)
+    repr_aug = recommender.get_mixed_representation(
+        input_ids=input_ids,
+        T=T_probe,
+        pool_ids=input_ids,
+        lam=lam_probe,
+    )
     aug_loss = recommender.rec_loss(repr_aug, target_pos, target_neg)
 
     orig_val = orig_loss.item()
@@ -230,15 +221,15 @@ def probe_continuous_input(
 
     # Threshold for determining if continuous inputs are acceptable.
     # A ratio > PROBE_LOSS_RATIO_THRESHOLD means augmented embeddings cause
-    # significantly higher loss than original ids, suggesting the mixed
-    # representation design assumption may not hold.
+    # significantly higher loss than original ids, suggesting the pre-encoder
+    # continuous augmentation design assumption may not hold.
     _PROBE_LOSS_RATIO_THRESHOLD = 3.0
 
     print(f"[Probe] orig_loss={orig_val:.4f}  aug_loss={aug_val:.4f}  ratio={ratio:.3f}")
     if ratio < _PROBE_LOSS_RATIO_THRESHOLD:
-        print("[Probe] ✓ Recommender accepts mixed inputs. Proceed with ASTAR.")
+        print("[Probe] ✓ Recommender accepts continuous inputs. Proceed with ASTAR.")
     else:
-        print("[Probe] ✗ WARNING: Large loss increase with mixed inputs.")
+        print("[Probe] ✗ WARNING: Large loss increase with continuous inputs.")
         print("         Consider pre-training augmenter longer or revising design.")
 
     return {

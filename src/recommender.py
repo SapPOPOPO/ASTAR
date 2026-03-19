@@ -153,6 +153,30 @@ class SASRec(nn.Module):
         logits = torch.matmul(repr_, w.T) + self.output_bias  # [B, V]
         return logits
 
+    # ── augmented view ───────────────────────────────────────────────────────
+
+    def get_mixed_representation(
+        self,
+        input_ids: torch.Tensor,   # [B, L]
+        T: torch.Tensor,           # [B, P, L]  (hard or soft)
+        pool_ids: torch.Tensor,    # [B, P]
+        lam: torch.Tensor,         # [B, 1]
+    ) -> torch.Tensor:
+        """Produce the λ-blended augmented sequence representation.
+
+        Looks up embeddings from the recommender's own table, applies T to
+        select/blend pool embeddings, then λ-blends with the original sequence
+        before passing through the transformer encoder.
+
+        Returns:
+            [B, D]  sequence representation of the blended view
+        """
+        org_emb  = self.item_embeddings(input_ids)                        # [B, L, D]
+        pool_emb = self.item_embeddings(pool_ids)                         # [B, P, D]
+        aug_emb  = torch.einsum('bpl,bpd->bld', T, pool_emb)             # [B, L, D]
+        mixed    = lam.unsqueeze(-1) * aug_emb + (1 - lam.unsqueeze(-1)) * org_emb
+        return self.get_representation(inputs_embeds=mixed)
+
     # ── losses ───────────────────────────────────────────────────────────────
 
     def rec_loss(
@@ -178,33 +202,6 @@ class SASRec(nn.Module):
 
         loss = -F.logsigmoid(pos_score - neg_score).mean()
         return loss
-
-    # ── augmented mixed representation ──────────────────────────────────────
-
-    def get_mixed_representation(
-        self,
-        input_ids: torch.Tensor,
-        aug_emb: torch.Tensor,
-        lam: torch.Tensor,
-    ) -> torch.Tensor:
-        """Return the representation of a λ-blended augmented sequence.
-
-        Blends aug_emb (produced by T @ pool_emb in the trainer) with the
-        recommender's own embedding of Org_Seq, then runs the transformer.
-
-        Args:
-            input_ids: [B, L]     original item ids (used to look up Org_Emb
-                                  and to infer the padding mask)
-            aug_emb:   [B, L, D]  augmented embeddings from T @ pool_emb
-            lam:       [B, 1]     per-sequence blend weight
-
-        Returns:
-            [B, D]  sequence representation at the last non-padding position
-        """
-        org_emb = self.item_embeddings(input_ids)                    # [B, L, D]
-        lam3 = lam.unsqueeze(-1)                                      # [B, 1, 1]
-        mixed = lam3 * aug_emb + (1.0 - lam3) * org_emb              # [B, L, D]
-        return self.get_representation(input_ids=input_ids, inputs_embeds=mixed)
 
     # ── full forward ─────────────────────────────────────────────────────────
 

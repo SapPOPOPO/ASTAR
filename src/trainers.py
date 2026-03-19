@@ -3,15 +3,12 @@ trainers.py — Two-phase adversarial training for ASTAR.
 
 Training protocol per batch:
     Phase 1: Update Recommender (augmenter frozen)
-        - Run augmenter with no_grad → T, pool_ids, lam
-        - Apply Gumbel straight-through (hard=True, dim=1) → hard_T, detach
-        - Compute aug_emb = einsum('bpj,bpd->bjd', hard_T, pool_emb)
+        - Generate aug from augmenter (no_grad)
         - Compute L_B = L_rec_orig + γ·L_rec_aug + λ_cl·L_contrast
         - Update recommender parameters
 
     Phase 2: Update Augmenter (recommender frozen)
-        - Run augmenter with gradients → T (soft), pool_ids, lam
-        - Compute aug_emb = einsum('bpj,bpd->bjd', T, pool_emb.detach())
+        - Re-generate aug (with gradients)
         - Compute L_A = β·L_rec_aug − α·L_contrast
         - Update augmenter parameters
 
@@ -111,23 +108,14 @@ class AdvAugmentTrainer:
         self.augmenter.eval()
         self.rec_optimizer.zero_grad()
 
-        # Run augmenter frozen to get T_logits, pool_ids, lam
+        # Generate T, pool_ids, lam without gradients (augmenter fixed)
         with torch.no_grad():
-            T, pool_ids, lam = self.augmenter(
-                input_ids,
-                rec_item_embeddings=self.recommender.item_embeddings,
-                lambda_ceiling=self.lambda_ceiling,
-            )
+            T, pool_ids, lam = self.augmenter(input_ids, self.lambda_ceiling)
 
-        # Hard T via Gumbel straight-through (one-hot columns), then detach
-        # so no gradients flow back to the augmenter.
+        # Hard Gumbel ST over pool dim=1 using stored logits, then detach
         hard_T = F.gumbel_softmax(
             self.augmenter._last_T_logits, tau=self.augmenter.tau, hard=True, dim=1
-        ).detach()  # [B, P, L]
-
-        # Compute aug_emb using recommender's own embeddings and hard_T
-        pool_emb = self.recommender.item_embeddings(pool_ids)           # [B, P, D]
-        aug_emb = torch.einsum("bpj,bpd->bjd", hard_T, pool_emb)       # [B, L, D]
+        ).detach()
 
         # L_rec_orig: recommendation loss on original sequence
         repr_orig, L_rec_orig = self.recommender(
@@ -136,9 +124,9 @@ class AdvAugmentTrainer:
             target_neg=target_neg,
         )
 
-        # L_rec_aug: recommendation consistency on augmented view
+        # L_rec_aug: recommendation consistency on hard-augmented view
         repr_aug = self.recommender.get_mixed_representation(
-            input_ids, aug_emb, lam.detach()
+            input_ids, hard_T, pool_ids.detach(), lam.detach()
         )
         L_rec_aug = self.recommender.rec_loss(repr_aug, target_pos, target_neg)
 
@@ -170,22 +158,23 @@ class AdvAugmentTrainer:
         self.augmenter.train()
         self.aug_optimizer.zero_grad()
 
-        # Run augmenter WITH gradients — soft T so gradient flows through T
-        T, pool_ids, lam = self.augmenter(
-            input_ids,
-            rec_item_embeddings=self.recommender.item_embeddings,
-            lambda_ceiling=self.lambda_ceiling,
-        )
+        # Re-generate T, pool_ids, lam WITH gradients for augmenter
+        T, pool_ids, lam = self.augmenter(input_ids, self.lambda_ceiling)
 
-        # Detach pool_emb so gradients flow through T but not into the
-        # recommender's embedding table.
-        pool_emb = self.recommender.item_embeddings(pool_ids).detach()  # [B, P, D]
-        aug_emb = torch.einsum("bpj,bpd->bjd", T, pool_emb)             # [B, L, D]
-
+        # repr_orig through frozen recommender (no grad needed)
         with torch.no_grad():
             repr_orig = self.recommender.get_representation(input_ids=input_ids)
 
-        repr_aug = self.recommender.get_mixed_representation(input_ids, aug_emb, lam)
+        # Embeddings from recommender are detached so no grad flows into recommender
+        # weights; grad flows only through T and lam (augmenter params).
+        # NOTE: this intentionally inlines the mixing instead of calling
+        # get_mixed_representation(), which does not detach embeddings.
+        pool_emb = self.recommender.item_embeddings(pool_ids).detach()  # [B, P, D]
+        org_emb  = self.recommender.item_embeddings(input_ids).detach() # [B, L, D]
+        aug_emb  = torch.einsum('bpl,bpd->bld', T, pool_emb)           # [B, L, D]
+        mixed    = lam.unsqueeze(-1) * aug_emb + (1 - lam.unsqueeze(-1)) * org_emb
+
+        repr_aug = self.recommender.get_representation(inputs_embeds=mixed)
         L_rec_aug = self.recommender.rec_loss(repr_aug, target_pos, target_neg)
 
         # L_contrast: maximise distance (adversarial)

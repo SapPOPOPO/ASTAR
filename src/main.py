@@ -155,8 +155,6 @@ def build_models(args: argparse.Namespace, num_items: int, device: torch.device)
         tau_decay=args.tau_decay,
     ).to(device)
 
-    # Augmenter no longer has its own embedding table; it uses
-    # the recommender's item_embeddings at runtime.
     return recommender, augmenter
 
 
@@ -171,11 +169,8 @@ def apply_ablation(args: argparse.Namespace, trainer: AdvAugmentTrainer) -> None
         # Monkey-patch the augmenter forward to fix λ at 0.5
         original_forward = trainer.augmenter.forward
 
-        def fixed_lam_forward(input_ids, rec_item_embeddings, lambda_ceiling=0.8):
-            T, pool_ids, lam = original_forward(
-                input_ids, rec_item_embeddings=rec_item_embeddings,
-                lambda_ceiling=lambda_ceiling,
-            )
+        def fixed_lam_forward(input_ids, lambda_ceiling=0.8):
+            T, pool_ids, lam = original_forward(input_ids, lambda_ceiling)
             B = input_ids.size(0)
             fixed = torch.full((B, 1), 0.5, device=input_ids.device)
             return T, pool_ids, fixed
@@ -191,17 +186,14 @@ def apply_ablation(args: argparse.Namespace, trainer: AdvAugmentTrainer) -> None
             trainer.augmenter.train()
             trainer.aug_optimizer.zero_grad()
 
-            T, pool_ids, lam = trainer.augmenter(
-                input_ids,
-                rec_item_embeddings=trainer.recommender.item_embeddings,
-                lambda_ceiling=trainer.lambda_ceiling,
-            )
-            pool_emb = trainer.recommender.item_embeddings(pool_ids).detach()
-            aug_emb = torch.einsum("bpj,bpd->bjd", T, pool_emb)
-
+            T, pool_ids, lam = trainer.augmenter(input_ids, trainer.lambda_ceiling)
             with torch.no_grad():
                 repr_orig = trainer.recommender.get_representation(input_ids=input_ids)
-            repr_aug = trainer.recommender.get_mixed_representation(input_ids, aug_emb, lam)
+            pool_emb = trainer.recommender.item_embeddings(pool_ids).detach()
+            org_emb = trainer.recommender.item_embeddings(input_ids).detach()
+            aug_emb = torch.einsum('bpl,bpd->bld', T, pool_emb)
+            mixed = lam.unsqueeze(-1) * aug_emb + (1 - lam.unsqueeze(-1)) * org_emb
+            repr_aug = trainer.recommender.get_representation(inputs_embeds=mixed)
             L_rec_aug = trainer.recommender.rec_loss(repr_aug, target_pos, target_neg)
             # Cooperative: minimise contrast (no negation)
             L_contrast = trainer.nce_loss(repr_orig.detach(), repr_aug)
@@ -271,13 +263,10 @@ def main() -> None:
     if args.visualize_only:
         plot_dir = os.path.join(args.plot_dir, args.dataset)
         visualize_T(augmenter, test_loader, device,
-                    rec_item_embeddings=recommender.item_embeddings,
                     save_path=os.path.join(plot_dir, "T_heatmap.png"))
         visualize_lambda(augmenter, test_loader, device,
-                         rec_item_embeddings=recommender.item_embeddings,
                          save_path=os.path.join(plot_dir, "lambda_dist.png"))
-        intra, inter = compute_intra_inter_ratio(augmenter, test_loader, device,
-                                                 rec_item_embeddings=recommender.item_embeddings)
+        intra, inter = compute_intra_inter_ratio(augmenter, test_loader, device)
         print(f"Intra: {intra:.4f}  Inter: {inter:.4f}")
         return
 
@@ -348,10 +337,8 @@ def main() -> None:
     plot_dir = os.path.join(args.plot_dir, args.dataset, args.ablation)
     try:
         visualize_T(augmenter, test_loader, device,
-                    rec_item_embeddings=recommender.item_embeddings,
                     save_path=os.path.join(plot_dir, "T_heatmap.png"))
         visualize_lambda(augmenter, test_loader, device,
-                         rec_item_embeddings=recommender.item_embeddings,
                          save_path=os.path.join(plot_dir, "lambda_dist.png"))
     except Exception as exc:
         print(f"[warn] Visualisation failed: {exc}")
