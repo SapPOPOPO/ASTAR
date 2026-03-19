@@ -118,10 +118,13 @@ class GANDiagnostics:
             result["mean_aug_cosine_similarity"] = mean_cos
             result["temporal_collapse_risk"] = float(mean_cos > 0.95)
 
-        # Player dominance: large ratio between L_B and L_A
+        # Player dominance: compare absolute magnitudes of L_B and L_A
         if self._L_B and self._L_A:
-            ratio = float(np.mean(self._L_B)) / (float(np.mean(self._L_A)) + 1e-8)
-            result["loss_ratio_B_over_A"] = ratio
+            abs_B = abs(float(np.mean(self._L_B)))
+            abs_A = abs(float(np.mean(self._L_A)))
+            ratio = abs_B / (abs_A + 1e-8)
+            result["loss_magnitude_ratio_B_over_A"] = ratio
+            # Dominance: if one player is >7x larger in magnitude
             result["player_dominance_risk"] = float(abs(np.log(ratio + 1e-8)) > 2.0)
 
         # λ statistics
