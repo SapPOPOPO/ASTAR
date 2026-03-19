@@ -155,9 +155,8 @@ def build_models(args: argparse.Namespace, num_items: int, device: torch.device)
         tau_decay=args.tau_decay,
     ).to(device)
 
-    # Initialise augmenter embeddings from recommender
-    augmenter.copy_embeddings_from(recommender)
-
+    # Augmenter no longer has its own embedding table; it uses
+    # the recommender's item_embeddings at runtime.
     return recommender, augmenter
 
 
@@ -172,22 +171,14 @@ def apply_ablation(args: argparse.Namespace, trainer: AdvAugmentTrainer) -> None
         # Monkey-patch the augmenter forward to fix λ at 0.5
         original_forward = trainer.augmenter.forward
 
-        def fixed_lam_forward(input_ids, lambda_ceiling=0.8):
-            aug_orig, T, lam = original_forward(input_ids, lambda_ceiling)
+        def fixed_lam_forward(input_ids, rec_item_embeddings, lambda_ceiling=0.8):
+            T, pool_ids, lam = original_forward(
+                input_ids, rec_item_embeddings=rec_item_embeddings,
+                lambda_ceiling=lambda_ceiling,
+            )
             B = input_ids.size(0)
             fixed = torch.full((B, 1), 0.5, device=input_ids.device)
-            # Recompute aug with fixed lambda=0.5 using the underlying T_S and S_intra
-            # We must rebuild from the T and S_pool since aug_orig used learned lam.
-            # Retrieve S_intra from augmenter embeddings directly:
-            S_intra = trainer.augmenter.item_embeddings(input_ids)
-            # Recover T_S from the original blend equation:
-            # aug_orig = lam3 * T_S + (1 - lam3) * S_intra
-            # => T_S = (aug_orig - (1 - lam3) * S_intra) / lam3
-            lam3 = lam.unsqueeze(2).clamp(min=1e-4)
-            T_S = (aug_orig - (1.0 - lam3) * S_intra) / lam3
-            # Apply fixed lambda=0.5
-            aug = 0.5 * T_S + 0.5 * S_intra
-            return aug, T, fixed
+            return T, pool_ids, fixed
 
         trainer.augmenter.forward = fixed_lam_forward
 
@@ -200,10 +191,17 @@ def apply_ablation(args: argparse.Namespace, trainer: AdvAugmentTrainer) -> None
             trainer.augmenter.train()
             trainer.aug_optimizer.zero_grad()
 
-            aug, _, lam = trainer._generate_aug(input_ids, grad=True)
+            T, pool_ids, lam = trainer.augmenter(
+                input_ids,
+                rec_item_embeddings=trainer.recommender.item_embeddings,
+                lambda_ceiling=trainer.lambda_ceiling,
+            )
+            pool_emb = trainer.recommender.item_embeddings(pool_ids).detach()
+            aug_emb = torch.einsum("bpj,bpd->bjd", T, pool_emb)
+
             with torch.no_grad():
                 repr_orig = trainer.recommender.get_representation(input_ids=input_ids)
-            repr_aug = trainer.recommender.get_representation(inputs_embeds=aug)
+            repr_aug = trainer.recommender.get_mixed_representation(input_ids, aug_emb, lam)
             L_rec_aug = trainer.recommender.rec_loss(repr_aug, target_pos, target_neg)
             # Cooperative: minimise contrast (no negation)
             L_contrast = trainer.nce_loss(repr_orig.detach(), repr_aug)
@@ -273,10 +271,13 @@ def main() -> None:
     if args.visualize_only:
         plot_dir = os.path.join(args.plot_dir, args.dataset)
         visualize_T(augmenter, test_loader, device,
+                    rec_item_embeddings=recommender.item_embeddings,
                     save_path=os.path.join(plot_dir, "T_heatmap.png"))
         visualize_lambda(augmenter, test_loader, device,
+                         rec_item_embeddings=recommender.item_embeddings,
                          save_path=os.path.join(plot_dir, "lambda_dist.png"))
-        intra, inter = compute_intra_inter_ratio(augmenter, test_loader, device)
+        intra, inter = compute_intra_inter_ratio(augmenter, test_loader, device,
+                                                 rec_item_embeddings=recommender.item_embeddings)
         print(f"Intra: {intra:.4f}  Inter: {inter:.4f}")
         return
 
@@ -347,8 +348,10 @@ def main() -> None:
     plot_dir = os.path.join(args.plot_dir, args.dataset, args.ablation)
     try:
         visualize_T(augmenter, test_loader, device,
+                    rec_item_embeddings=recommender.item_embeddings,
                     save_path=os.path.join(plot_dir, "T_heatmap.png"))
         visualize_lambda(augmenter, test_loader, device,
+                         rec_item_embeddings=recommender.item_embeddings,
                          save_path=os.path.join(plot_dir, "lambda_dist.png"))
     except Exception as exc:
         print(f"[warn] Visualisation failed: {exc}")
