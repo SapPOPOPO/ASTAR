@@ -12,6 +12,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 try:
@@ -39,15 +40,23 @@ def visualize_T(
     augmenter,
     dataloader: torch.utils.data.DataLoader,
     device: torch.device,
+    rec_item_embeddings: nn.Embedding,
     save_path: str = "plots/T_heatmap.png",
     max_batches: int = 50,
     lambda_ceiling: float = 0.8,
 ) -> None:
     """Average T matrix across the dataset and plot as heatmap.
 
+    T shape: [B, P, L] — rows are pool positions (source), columns are output
+    positions (target). Intra portion: T[:, :L, :] (own sequence pool rows).
+
+    Args:
+        rec_item_embeddings: recommender's item embedding module (required by
+                             the augmenter's new forward signature)
+
     Saves:
         {save_path}:   T_intra [L, L] heatmap  (own-sequence attention)
-        Alongside:     T_inter [L, K*L] mean per position  (cross-sequence)
+        Alongside:     T_inter [K*L, L] mean per output position  (cross-sequence)
     """
     _require_matplotlib()
     os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
@@ -57,23 +66,27 @@ def visualize_T(
     K = augmenter.K
     pool_size = (1 + K) * L
 
-    T_accum = torch.zeros(L, pool_size)
+    T_accum = torch.zeros(pool_size, L)
     count = 0
 
     for i, batch in enumerate(dataloader):
         if i >= max_batches:
             break
         input_ids = batch["input_ids"].to(device)
-        _, T, _ = augmenter(input_ids, lambda_ceiling=lambda_ceiling)
-        T_accum += T.cpu().mean(0)  # average over batch
+        T, _, _ = augmenter(
+            input_ids,
+            rec_item_embeddings=rec_item_embeddings,
+            lambda_ceiling=lambda_ceiling,
+        )
+        T_accum += T.cpu().mean(0)  # average over batch → [P, L]
         count += 1
 
-    T_avg = T_accum / max(count, 1)  # [L, (1+K)*L]
+    T_avg = T_accum / max(count, 1)  # [P, L] = [(1+K)*L, L]
 
-    T_intra = T_avg[:, :L].numpy()  # [L, L]
-    T_inter = T_avg[:, L:].numpy()  # [L, K*L]
-    inter_per_pos = T_inter.mean(axis=1)  # [L]  mean weight to inter-sequences
-    intra_per_pos = T_intra.sum(axis=1)   # [L]  total weight on own sequence
+    T_intra = T_avg[:L, :].numpy()   # [L, L]  rows=own-pool, cols=output
+    T_inter = T_avg[L:, :].numpy()   # [K*L, L]
+    intra_per_pos = T_intra.sum(axis=0)   # [L]  total intra weight per output position
+    inter_per_pos = T_inter.sum(axis=0)   # [L]  total inter weight per output position
 
     fig = plt.figure(figsize=(14, 6))
     gs = gridspec.GridSpec(1, 3, figure=fig, width_ratios=[3, 1, 1])
@@ -82,18 +95,18 @@ def visualize_T(
     ax0 = fig.add_subplot(gs[0])
     im = ax0.imshow(T_intra, aspect="auto", cmap="hot", vmin=0)
     ax0.set_title("T_intra: Own-sequence attention")
-    ax0.set_xlabel("Source position j")
-    ax0.set_ylabel("Target position i")
+    ax0.set_xlabel("Output position j")
+    ax0.set_ylabel("Pool position p (source)")
     plt.colorbar(im, ax=ax0)
 
-    # ── Intra vs inter per position ──────────────────────────────────────
+    # ── Intra vs inter per output position ───────────────────────────────
     ax1 = fig.add_subplot(gs[1])
     positions = np.arange(L)
     ax1.barh(positions, intra_per_pos, color="steelblue", label="intra")
     ax1.barh(positions, inter_per_pos, left=intra_per_pos, color="coral", label="inter")
     ax1.set_title("Intra vs Inter\nweight per position")
     ax1.set_xlabel("Attention weight")
-    ax1.set_ylabel("Position")
+    ax1.set_ylabel("Output position")
     ax1.legend(fontsize=8)
     ax1.invert_yaxis()
 
@@ -127,6 +140,7 @@ def visualize_lambda(
     augmenter,
     dataloader: torch.utils.data.DataLoader,
     device: torch.device,
+    rec_item_embeddings: nn.Embedding,
     save_path: str = "plots/lambda_dist.png",
     max_batches: int = 50,
     lambda_history: Optional[list] = None,
@@ -135,6 +149,8 @@ def visualize_lambda(
     """Plot λ distribution and its correlation with sequence length.
 
     Args:
+        rec_item_embeddings: recommender's item embedding module (required by
+                             the augmenter's new forward signature)
         lambda_history: list of (epoch, mean_lambda) tuples for trajectory plot
     """
     _require_matplotlib()
@@ -150,7 +166,11 @@ def visualize_lambda(
         input_ids = batch["input_ids"].to(device)
         seq_lens = (input_ids > 0).sum(dim=1).float().cpu().numpy()
 
-        _, _, lam = augmenter(input_ids, lambda_ceiling=lambda_ceiling)
+        _, _, lam = augmenter(
+            input_ids,
+            rec_item_embeddings=rec_item_embeddings,
+            lambda_ceiling=lambda_ceiling,
+        )
         lam_list.extend(lam.cpu().view(-1).numpy().tolist())
         len_list.extend(seq_lens.tolist())
 
@@ -256,10 +276,17 @@ def compute_intra_inter_ratio(
     augmenter,
     dataloader: torch.utils.data.DataLoader,
     device: torch.device,
+    rec_item_embeddings: nn.Embedding,
     max_batches: int = 50,
     lambda_ceiling: float = 0.8,
 ) -> Tuple[float, float]:
     """Compute mean intra / inter attention weights across the dataset.
+
+    T shape: [B, P, L] — intra portion is T[:, :L, :] (first L pool rows),
+    inter portion is T[:, L:, :].
+
+    Args:
+        rec_item_embeddings: recommender's item embedding module
 
     Returns:
         (mean_intra_weight, mean_inter_weight)
@@ -276,10 +303,14 @@ def compute_intra_inter_ratio(
         if i >= max_batches:
             break
         input_ids = batch["input_ids"].to(device)
-        _, T, _ = augmenter(input_ids, lambda_ceiling=lambda_ceiling)
-        # T: [B, L, (1+K)*L]
-        intra_weight = T[:, :, :L].sum(dim=-1).mean().item()
-        inter_weight = T[:, :, L:].sum(dim=-1).mean().item()
+        T, _, _ = augmenter(
+            input_ids,
+            rec_item_embeddings=rec_item_embeddings,
+            lambda_ceiling=lambda_ceiling,
+        )
+        # T: [B, P, L] — sum over pool rows gives weight per output position
+        intra_weight = T[:, :L, :].sum(dim=1).mean().item()   # [B, L] → scalar
+        inter_weight = T[:, L:, :].sum(dim=1).mean().item()
         intra_total += intra_weight
         inter_total += inter_weight
         count += 1
