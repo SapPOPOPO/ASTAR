@@ -73,13 +73,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weight_decay", type=float, default=1e-5)
 
     # Loss weights
-    p.add_argument("--gamma", type=float, default=0.5,
+    p.add_argument("--gamma", type=float, default=0.1,
                    help="Weight of L_rec_aug in recommender loss")
     p.add_argument("--lambda_cl", type=float, default=0.1,
                    help="Weight of contrastive loss in recommender loss")
     p.add_argument("--alpha", type=float, default=1.0,
                    help="Weight of -L_contrast in augmenter loss")
-    p.add_argument("--beta", type=float, default=0.5,
+    p.add_argument("--beta", type=float, default=1.0,
                    help="Weight of L_rec_aug in augmenter loss")
     p.add_argument("--cl_temperature", type=float, default=0.07)
 
@@ -172,7 +172,7 @@ def apply_ablation(args: argparse.Namespace, trainer: AdvAugmentTrainer) -> None
         def fixed_lam_forward(input_ids, lambda_ceiling=0.8):
             T, pool_ids, lam = original_forward(input_ids, lambda_ceiling)
             B = input_ids.size(0)
-            fixed = torch.full((B, 1), 0.5, device=input_ids.device)
+            fixed = torch.full((B, 1), 0.7, device=input_ids.device)
             return T, pool_ids, fixed
 
         trainer.augmenter.forward = fixed_lam_forward

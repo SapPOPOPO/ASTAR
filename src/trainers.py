@@ -4,7 +4,7 @@ trainers.py — Two-phase adversarial training for ASTAR.
 Training protocol per batch:
     Phase 1: Update Recommender (augmenter frozen)
         - Generate aug from augmenter (no_grad)
-        - Compute L_B = L_rec_orig + γ·L_rec_aug + λ_cl·L_contrast
+        - Compute L_B = L_rec_orig + γ·L_rec_org + λ_cl·L_contrast
         - Update recommender parameters
 
     Phase 2: Update Augmenter (recommender frozen)
@@ -57,7 +57,7 @@ class AdvAugmentTrainer:
         rec_optimizer: torch.optim.Optimizer,
         aug_optimizer: torch.optim.Optimizer,
         device: torch.device,
-        gamma: float = 0.5,
+        gamma: float = 0.01,
         lambda_cl: float = 0.1,
         alpha: float = 1.0,
         beta: float = 0.5,

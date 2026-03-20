@@ -29,15 +29,16 @@ def load_interactions(data_path: str) -> Tuple[Dict[int, List[int]], int, int]:
     """Read interaction file and return per-user item lists.
 
     Supports two formats:
-        ``user item``  (two columns)
-        ``user item timestamp``  (three columns – sorted by timestamp assumed)
+        ``user item``              (one interaction per line)
+        ``user item timestamp``   (one interaction per line, sorted by time)
+        ``user item1 item2 ...``  (whole sequence per line, chronological order)
 
     Returns:
         user_seq:    dict mapping user_id → list[item_id] (chronological)
         num_users:   total number of users (max user id)
         num_items:   total number of items (max item id, 1-indexed)
     """
-    user_seq: Dict[int, List[int]] = defaultdict(list)
+    user_seq: Dict[int, List[int]] = {}
     max_item = 0
     max_user = 0
 
@@ -46,12 +47,13 @@ def load_interactions(data_path: str) -> Tuple[Dict[int, List[int]], int, int]:
             parts = line.strip().split()
             if len(parts) < 2:
                 continue
-            u, i = int(parts[0]), int(parts[1])
-            user_seq[u].append(i)
-            max_item = max(max_item, i)
+            u = int(parts[0])
+            items = [int(x) for x in parts[1:]]
+            user_seq[u] = items
+            max_item = max(max_item, max(items))
             max_user = max(max_user, u)
 
-    return dict(user_seq), max_user, max_item
+    return user_seq, max_user, max_item
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -97,7 +99,7 @@ class RecDataset(Dataset):
                 input_seq = seq[:-2]
                 target = seq[-2]  # second-to-last predicts last-valid
                 # For training, use all available prefixes (data augmentation)
-                for end in range(1, len(input_seq) + 1):
+                for end in range(1, len(input_seq)):
                     prefix = input_seq[:end]
                     self.users.append(user)
                     self.input_ids.append(prefix)
@@ -127,11 +129,11 @@ class RecDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         input_ids = torch.tensor(self._pad(self.input_ids[idx]), dtype=torch.long)
-        target_pos = torch.tensor(self.target_pos[idx], dtype=torch.long)
         return {
             "user": torch.tensor(self.users[idx], dtype=torch.long),
             "input_ids": input_ids,
-            "target_pos": target_pos,
+            "target_pos": torch.tensor(self.target_pos[idx], dtype=torch.long),
+            "train_history": torch.tensor(self._pad(self.train_history[idx]), dtype=torch.long),  # ← pad this
         }
 
 
@@ -165,7 +167,7 @@ class TrainDataset(Dataset):
                 continue
             # Leave out last two items (val, test)
             train_seq = seq[:-2]
-            for end in range(1, len(train_seq) + 1):
+            for end in range(1, len(train_seq)):
                 self.users.append(user)
                 self.input_ids.append(train_seq[:end])
                 self.target_pos.append(
@@ -254,7 +256,7 @@ class EvalDataset(Dataset):
             "user": torch.tensor(self.users[idx], dtype=torch.long),
             "input_ids": input_ids,
             "target_pos": torch.tensor(self.target_pos[idx], dtype=torch.long),
-            "train_history": torch.tensor(self.train_history[idx], dtype=torch.long),
+            "train_history": torch.tensor(self._pad(self.train_history[idx]), dtype=torch.long),  # ← pad this
         }
 
 
