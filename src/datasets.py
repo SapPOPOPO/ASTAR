@@ -133,7 +133,6 @@ class RecDataset(Dataset):
             "user": torch.tensor(self.users[idx], dtype=torch.long),
             "input_ids": input_ids,
             "target_pos": torch.tensor(self.target_pos[idx], dtype=torch.long),
-            "train_history": torch.tensor(self._pad(self.train_history[idx]), dtype=torch.long),  # ← pad this
         }
 
 
@@ -170,9 +169,9 @@ class TrainDataset(Dataset):
             for end in range(1, len(train_seq)):
                 self.users.append(user)
                 self.input_ids.append(train_seq[:end])
-                self.target_pos.append(
-                    train_seq[end] if end < len(train_seq) else seq[-2]
-                )
+                # target is always the next item within train_seq; end ranges
+                # from 1 to len(train_seq)-1 so train_seq[end] is always valid
+                self.target_pos.append(train_seq[end])
 
     def _pad(self, seq: List[int]) -> List[int]:
         if len(seq) >= self.max_seq_len:

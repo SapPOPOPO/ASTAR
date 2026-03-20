@@ -175,7 +175,12 @@ class SASRec(nn.Module):
         pool_emb = self.item_embeddings(pool_ids)                         # [B, P, D]
         aug_emb  = torch.einsum('bpl,bpd->bld', T, pool_emb)             # [B, L, D]
         mixed    = lam.unsqueeze(-1) * aug_emb + (1 - lam.unsqueeze(-1)) * org_emb
-        return self.get_representation(inputs_embeds=mixed)
+        # Zero out positions that are padding in the original sequence so
+        # padding slots remain masked correctly downstream.
+        pad_mask = (input_ids > 0).unsqueeze(-1).float()  # [B, L, 1]
+        mixed = mixed * pad_mask
+        # Pass input_ids as the authoritative mask source alongside blended embeddings.
+        return self.get_representation(input_ids=input_ids, inputs_embeds=mixed)
 
     # ── losses ───────────────────────────────────────────────────────────────
 

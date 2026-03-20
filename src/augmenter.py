@@ -240,7 +240,6 @@ class ASTARAugmenter(nn.Module):
         # Add Gaussian noise to prevent temporal collapse
         noise = torch.randn_like(lam) * self.LAMBDA_NOISE_SCALE
         lam = (lam + noise).clamp(self.MIN_LAMBDA, lambda_ceiling)  # [B, 1]
-        lam = torch.ones_like(lam) * 0.8
 
         return T, pool_ids, lam
 
