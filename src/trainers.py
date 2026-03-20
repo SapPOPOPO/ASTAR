@@ -165,16 +165,10 @@ class AdvAugmentTrainer:
         with torch.no_grad():
             repr_orig = self.recommender.get_representation(input_ids=input_ids)
 
-        # Embeddings from recommender are detached so no grad flows into recommender
-        # weights; grad flows only through T and lam (augmenter params).
-        # NOTE: this intentionally inlines the mixing instead of calling
-        # get_mixed_representation(), which does not detach embeddings.
-        pool_emb = self.recommender.item_embeddings(pool_ids).detach()  # [B, P, D]
-        org_emb  = self.recommender.item_embeddings(input_ids).detach() # [B, L, D]
-        aug_emb  = torch.einsum('bpl,bpd->bld', T, pool_emb)           # [B, L, D]
-        mixed    = lam.unsqueeze(-1) * aug_emb + (1 - lam.unsqueeze(-1)) * org_emb
-
-        repr_aug = self.recommender.get_representation(inputs_embeds=mixed)
+        # Grad flows through T and lam (augmenter params) via the einsum and
+        # λ-blend inside get_mixed_representation; pool_ids is an integer tensor
+        # so no grad flows through index selection into recommender weights.
+        repr_aug = self.recommender.get_mixed_representation(input_ids, T, pool_ids, lam)
         L_rec_aug = self.recommender.rec_loss(repr_aug, target_pos, target_neg)
 
         # L_contrast: maximise distance (adversarial)
