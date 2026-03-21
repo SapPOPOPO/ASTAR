@@ -10,9 +10,7 @@ Input format: inter_*.txt with space-separated user-item interactions,
               sorted by time (each row: user item [timestamp]).
 """
 
-import os
 import random
-from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -100,10 +98,13 @@ class RecDataset(Dataset):
                 target = seq[-2]  # second-to-last predicts last-valid
                 # For training, use all available prefixes (data augmentation)
                 for end in range(1, len(input_seq)):
-                    prefix = input_seq[:end]
                     self.users.append(user)
-                    self.input_ids.append(prefix)
-                    self.target_pos.append(seq[end] if end < len(input_seq) else target)
+                    self.input_ids.append(input_seq[:end])
+                    self.target_pos.append(input_seq[end])
+                # Also add the full input_seq predicting the validation target
+                self.users.append(user)
+                self.input_ids.append(input_seq)
+                self.target_pos.append(target)
 
             elif split == "valid":
                 input_seq = seq[:-2]
@@ -234,7 +235,7 @@ class EvalDataset(Dataset):
             else:
                 input_seq = seq[:-1]
                 target = seq[-1]
-                train_items = seq[:-1]
+                train_items = seq[:-2]  # consistent with valid split: only training items
 
             self.users.append(user)
             self.input_ids.append(input_seq)

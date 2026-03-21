@@ -4,7 +4,7 @@ trainers.py — Two-phase adversarial training for ASTAR.
 Training protocol per batch:
     Phase 1: Update Recommender (augmenter frozen)
         - Generate aug from augmenter (no_grad)
-        - Compute L_B = L_rec_orig + γ·L_rec_org + λ_cl·L_contrast
+        - Compute L_B = L_rec_orig + γ·L_rec_aug + λ_cl·L_contrast
         - Update recommender parameters
 
     Phase 2: Update Augmenter (recommender frozen)
@@ -19,7 +19,7 @@ Warmup strategy:
 
 import os
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 import torch.nn as nn
@@ -87,7 +87,7 @@ class AdvAugmentTrainer:
 
     @property
     def is_warmup(self) -> bool:
-        return self._current_epoch < self.warmup_epochs
+        return self._current_epoch <= self.warmup_epochs
 
     @property
     def lambda_ceiling(self) -> float:
@@ -112,9 +112,9 @@ class AdvAugmentTrainer:
         with torch.no_grad():
             T, pool_ids, lam = self.augmenter(input_ids, self.lambda_ceiling)
 
-        # Hard Gumbel ST over pool dim=1 using stored logits, then detach
+        # Hard Gumbel ST over pool dim=1 using masked logits (padding excluded)
         hard_T = F.gumbel_softmax(
-            self.augmenter._last_T_logits, tau=self.augmenter.tau, hard=True, dim=1
+            self.augmenter._last_T_logits_masked, tau=self.augmenter.tau, hard=True, dim=1
         ).detach()
 
         # L_rec_orig: recommendation loss on original sequence
@@ -326,6 +326,8 @@ class AdvAugmentTrainer:
         if os.path.exists(best_ckpt):
             ckpt = torch.load(best_ckpt, map_location=self.device)
             self.recommender.load_state_dict(ckpt["recommender"])
+            if "augmenter" in ckpt:
+                self.augmenter.load_state_dict(ckpt["augmenter"])
 
         test_metrics = self.evaluate(test_loader)
         if verbose:

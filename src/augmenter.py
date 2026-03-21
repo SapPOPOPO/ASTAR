@@ -89,6 +89,9 @@ class ASTARAugmenter(nn.Module):
         # Stores T_logits [B, P, L] from the most recent forward pass so the
         # trainer can apply hard Gumbel ST without re-running the augmenter.
         self._last_T_logits: Optional[torch.Tensor] = None
+        # Stores T_logits after masked_fill (padding positions set to -inf) so
+        # the hard Gumbel ST in Phase 1 cannot sample from padding pool positions.
+        self._last_T_logits_masked: Optional[torch.Tensor] = None
 
         self._init_weights()
 
@@ -146,9 +149,6 @@ class ASTARAugmenter(nn.Module):
             candidates = [i for i in range(B) if i != b]
             # Sample K with replacement if batch too small
             if len(candidates) >= K:
-                chosen = torch.tensor(
-                    candidates[:K], device=input_ids.device
-                )  # deterministic for K≤B-1
                 # Randomly shuffle to avoid always picking the same K
                 perm = torch.randperm(len(candidates), device=input_ids.device)[:K]
                 chosen = torch.tensor(candidates, device=input_ids.device)[perm]
@@ -180,6 +180,7 @@ class ASTARAugmenter(nn.Module):
         # Expand mask for broadcasting over L output positions
         mask = pool_mask.unsqueeze(-1).expand_as(T_logits)  # [B, P, L]
         T_logits = T_logits.masked_fill(~mask.bool(), float("-inf"))
+        self._last_T_logits_masked = T_logits  # stored for hard Gumbel ST (padding already masked)
         T = F.softmax(T_logits / self.tau, dim=1)
         # Replace any NaN columns (all-masked pool for a given output position) with
         # uniform over non-masked pool positions (zero weight on padding positions)
