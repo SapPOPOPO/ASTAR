@@ -21,7 +21,7 @@ from augmenter import ASTARAugmenter
 from datasets import build_dataloaders
 from diagnose import GANDiagnostics, probe_continuous_input
 from recommender import SASRec
-from trainers import AdvAugmentTrainer
+from trainers import AdvAugmentTrainer, CoSeRecTrainer
 from utils import set_seed
 from visualize import (
     compute_intra_inter_ratio,
@@ -117,6 +117,15 @@ def parse_args() -> argparse.Namespace:
                    help="Path to checkpoint to load for evaluation / visualisation")
     p.add_argument("--verbose", action="store_true", default=True)
     p.add_argument("--no_verbose", dest="verbose", action="store_false")
+
+    # Model selection
+    p.add_argument(
+        "--model",
+        type=str,
+        default="astar",
+        choices=["astar", "cosrec"],
+        help="Model to train: 'astar' (default) or 'cosrec' (CoSeRec baseline)",
+    )
 
     return p.parse_args()
 
@@ -239,15 +248,28 @@ def main() -> None:
     print(f"  train={len(train_loader.dataset)}  valid={len(valid_loader.dataset)}  test={len(test_loader.dataset)}")
 
     # ── Models ────────────────────────────────────────────────────────────
-    recommender, augmenter = build_models(args, num_items, device)
-    print(f"Recommender params: {sum(p.numel() for p in recommender.parameters()):,}")
-    print(f"Augmenter params:   {sum(p.numel() for p in augmenter.parameters()):,}")
+    if args.model == "cosrec":
+        recommender = SASRec(
+            num_items=num_items,
+            hidden_size=args.hidden_size,
+            max_seq_len=args.max_seq_len,
+            num_heads=args.num_heads,
+            num_layers=args.num_layers,
+            inner_size=args.inner_size,
+            dropout=args.dropout,
+        ).to(device)
+        augmenter = None
+        print(f"Recommender params: {sum(p.numel() for p in recommender.parameters()):,}")
+    else:
+        recommender, augmenter = build_models(args, num_items, device)
+        print(f"Recommender params: {sum(p.numel() for p in recommender.parameters()):,}")
+        print(f"Augmenter params:   {sum(p.numel() for p in augmenter.parameters()):,}")
 
     # Load checkpoint if provided
     if args.checkpoint:
         ckpt = torch.load(args.checkpoint, map_location=device)
         recommender.load_state_dict(ckpt["recommender"])
-        if "augmenter" in ckpt:
+        if augmenter is not None and "augmenter" in ckpt:
             augmenter.load_state_dict(ckpt["augmenter"])
         print(f"Loaded checkpoint: {args.checkpoint}")
 
@@ -260,6 +282,9 @@ def main() -> None:
 
     # ── Visualise only ────────────────────────────────────────────────────
     if args.visualize_only:
+        if augmenter is None:
+            print("[warn] --visualize_only is only supported for --model astar")
+            return
         plot_dir = os.path.join(args.plot_dir, args.dataset)
         visualize_T(augmenter, test_loader, device,
                     save_path=os.path.join(plot_dir, "T_heatmap.png"))
@@ -267,6 +292,48 @@ def main() -> None:
                          save_path=os.path.join(plot_dir, "lambda_dist.png"))
         intra, inter = compute_intra_inter_ratio(augmenter, test_loader, device)
         print(f"Intra: {intra:.4f}  Inter: {inter:.4f}")
+        return
+
+    # ── CoSeRec path ──────────────────────────────────────────────────────
+    if args.model == "cosrec":
+        optimizer = torch.optim.Adam(
+            recommender.parameters(),
+            lr=args.rec_lr,
+            weight_decay=args.weight_decay,
+        )
+        save_dir = os.path.join(args.save_dir, args.dataset, "cosrec")
+        trainer = CoSeRecTrainer(
+            recommender=recommender,
+            optimizer=optimizer,
+            device=device,
+            max_seq_len=args.max_seq_len,
+            lambda_cl=args.lambda_cl,
+            cl_temperature=args.cl_temperature,
+        )
+
+        test_metrics = trainer.fit(
+            train_loader=train_loader,
+            valid_loader=valid_loader,
+            test_loader=test_loader,
+            num_epochs=args.num_epochs,
+            patience=args.patience,
+            save_dir=save_dir,
+            verbose=args.verbose,
+            log_interval=args.log_interval,
+        )
+
+        results = {
+            "dataset": args.dataset,
+            "model": "cosrec",
+            "seed": args.seed,
+            "test_metrics": test_metrics,
+            "args": vars(args),
+        }
+        os.makedirs(save_dir, exist_ok=True)
+        result_path = os.path.join(save_dir, "results.json")
+        with open(result_path, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"\nResults saved → {result_path}")
         return
 
     # ── Optimisers ────────────────────────────────────────────────────────

@@ -27,6 +27,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from augmenter import ASTARAugmenter
+from data_augmentation import Random as RandomAugmentor
 from modules import NCELoss
 from recommender import SASRec
 from utils import PerformanceTracker, aggregate_metrics, compute_metrics
@@ -328,6 +329,230 @@ class AdvAugmentTrainer:
             self.recommender.load_state_dict(ckpt["recommender"])
             if "augmenter" in ckpt:
                 self.augmenter.load_state_dict(ckpt["augmenter"])
+
+        test_metrics = self.evaluate(test_loader)
+        if verbose:
+            print(f"\nTest metrics (epoch {best_epoch}):")
+            for k, v in sorted(test_metrics.items()):
+                print(f"  {k}: {v:.4f}")
+
+        return test_metrics
+
+
+class CoSeRecTrainer:
+    """CoSeRec Trainer — CE + InfoNCE contrastive learning baseline.
+
+    Training protocol per batch:
+        - Apply two independent random augmentations to input_ids → aug_view_1, aug_view_2
+        - Compute representations: repr_orig, repr_aug1, repr_aug2
+        - L_ce = cross_entropy(score_all_items(repr_orig), target_pos)
+        - L_contrast = InfoNCE(repr_aug1, repr_aug2)
+        - L = L_ce + lambda_cl * L_contrast
+        - Single optimizer update
+
+    Args:
+        recommender:    SASRec model
+        optimizer:      optimizer for recommender
+        device:         torch device
+        max_seq_len:    maximum sequence length for padding
+        lambda_cl:      weight of contrastive loss
+        cl_temperature: InfoNCE temperature
+        aug_tao:        crop ratio
+        aug_gamma:      mask keep ratio
+        aug_beta:       reorder ratio
+    """
+
+    def __init__(
+        self,
+        recommender: SASRec,
+        optimizer: torch.optim.Optimizer,
+        device: torch.device,
+        max_seq_len: int = 50,
+        lambda_cl: float = 0.1,
+        cl_temperature: float = 0.07,
+        aug_tao: float = 0.2,
+        aug_gamma: float = 0.7,
+        aug_beta: float = 0.2,
+    ) -> None:
+        self.recommender = recommender
+        self.optimizer = optimizer
+        self.device = device
+        self.max_seq_len = max_seq_len
+        self.lambda_cl = lambda_cl
+        self.grad_clip_norm: float = 5.0
+
+        self.nce_loss = NCELoss(temperature=cl_temperature)
+        self.augmentor = RandomAugmentor(tao=aug_tao, gamma=aug_gamma, beta=aug_beta)
+
+    def _augment_batch(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Apply random augmentation to a batch of padded sequences.
+
+        Args:
+            input_ids: [B, L] left-padded sequences (zeros are padding)
+        Returns:
+            [B, L] augmented and re-padded sequences
+        """
+        B, L = input_ids.shape
+        rows = input_ids.tolist()
+        padded_rows = []
+
+        for row in rows:
+            # Strip padding zeros to get the raw item sequence
+            seq = [x for x in row if x != 0]
+
+            if len(seq) == 0:
+                padded_rows.append([0] * L)
+                continue
+
+            # Apply one random augmentation
+            aug_seq = self.augmentor(seq)
+
+            # Truncate to max_seq_len and left-pad with zeros
+            aug_seq = aug_seq[-self.max_seq_len:]
+            pad_len = L - len(aug_seq)
+            padded_rows.append([0] * pad_len + aug_seq)
+
+        return torch.tensor(padded_rows, dtype=input_ids.dtype, device=input_ids.device)
+
+    def train_epoch(self, train_loader: DataLoader) -> Dict[str, float]:
+        """Run one training epoch.
+
+        Returns:
+            mean losses over batches
+        """
+        self.recommender.train()
+        epoch_stats: List[Dict[str, float]] = []
+
+        for batch in train_loader:
+            input_ids = batch["input_ids"].to(self.device)
+            target_pos = batch["target_pos"].to(self.device)
+
+            self.optimizer.zero_grad()
+
+            # Two independent augmented views
+            aug_view_1 = self._augment_batch(input_ids)
+            aug_view_2 = self._augment_batch(input_ids)
+
+            # Compute sequence representations
+            repr_orig = self.recommender.get_representation(input_ids=input_ids)
+            repr_aug1 = self.recommender.get_representation(input_ids=aug_view_1)
+            repr_aug2 = self.recommender.get_representation(input_ids=aug_view_2)
+
+            # CE recommendation loss on original sequence (full softmax over all items)
+            scores = self.recommender.score_all_items(repr_orig)
+            L_ce = F.cross_entropy(scores, target_pos)
+
+            # InfoNCE contrastive loss between the two augmented views
+            L_contrast = self.nce_loss(repr_aug1, repr_aug2)
+
+            L = L_ce + self.lambda_cl * L_contrast
+            L.backward()
+            torch.nn.utils.clip_grad_norm_(self.recommender.parameters(), self.grad_clip_norm)
+            self.optimizer.step()
+
+            epoch_stats.append({
+                "L_ce": L_ce.item(),
+                "L_contrast": L_contrast.item(),
+                "L": L.item(),
+            })
+
+        return aggregate_metrics(epoch_stats)
+
+    @torch.no_grad()
+    def evaluate(
+        self,
+        eval_loader: DataLoader,
+        ks: Tuple[int, ...] = (5, 10, 20),
+    ) -> Dict[str, float]:
+        """Full-ranking evaluation with training-history masking.
+
+        Identical to AdvAugmentTrainer.evaluate().
+
+        Returns:
+            dict of HR@K, NDCG@K metrics
+        """
+        self.recommender.eval()
+        batch_results = []
+
+        for batch in eval_loader:
+            input_ids = batch["input_ids"].to(self.device)
+            target_pos = batch["target_pos"].to(self.device)
+            train_history = batch.get("train_history", None)
+            if train_history is not None:
+                train_history = train_history.to(self.device)
+
+            repr_ = self.recommender.get_representation(input_ids=input_ids)
+            scores = self.recommender.score_all_items(repr_)
+
+            metrics = compute_metrics(scores, target_pos, ks=ks, train_history=train_history)
+            batch_results.append(metrics)
+
+        return aggregate_metrics(batch_results)
+
+    def fit(
+        self,
+        train_loader: DataLoader,
+        valid_loader: DataLoader,
+        test_loader: DataLoader,
+        num_epochs: int = 200,
+        patience: int = 20,
+        save_dir: str = "checkpoints",
+        verbose: bool = True,
+        log_interval: int = 1,
+    ) -> Dict[str, float]:
+        """Train CoSeRec end-to-end with early stopping.
+
+        Returns:
+            best metrics on test set (evaluated at best validation epoch)
+        """
+        os.makedirs(save_dir, exist_ok=True)
+        best_ndcg = -1.0
+        best_epoch = 0
+        patience_counter = 0
+        best_ckpt = os.path.join(save_dir, "best_model.pt")
+
+        for epoch in range(1, num_epochs + 1):
+            t0 = time.time()
+            train_stats = self.train_epoch(train_loader)
+            elapsed = time.time() - t0
+
+            if epoch % log_interval == 0:
+                val_metrics = self.evaluate(valid_loader)
+                ndcg10 = val_metrics.get("NDCG@10", 0.0)
+
+                if verbose:
+                    print(
+                        f"Epoch {epoch:4d} | "
+                        f"L={train_stats.get('L', 0):.4f} "
+                        f"L_ce={train_stats.get('L_ce', 0):.4f} "
+                        f"L_contrast={train_stats.get('L_contrast', 0):.4f} | "
+                        f"Val NDCG@10={ndcg10:.4f} | "
+                        f"t={elapsed:.1f}s"
+                    )
+
+                if ndcg10 > best_ndcg:
+                    best_ndcg = ndcg10
+                    best_epoch = epoch
+                    patience_counter = 0
+                    torch.save(
+                        {
+                            "epoch": epoch,
+                            "recommender": self.recommender.state_dict(),
+                            "val_metrics": val_metrics,
+                        },
+                        best_ckpt,
+                    )
+                else:
+                    patience_counter += 1
+                    if patience_counter >= patience:
+                        if verbose:
+                            print(f"Early stopping at epoch {epoch} (best={best_epoch})")
+                        break
+
+        # Load best checkpoint and evaluate on test set
+        if os.path.exists(best_ckpt):
+            ckpt = torch.load(best_ckpt, map_location=self.device)
+            self.recommender.load_state_dict(ckpt["recommender"])
 
         test_metrics = self.evaluate(test_loader)
         if verbose:
