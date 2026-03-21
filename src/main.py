@@ -11,7 +11,6 @@ import argparse
 import os
 import sys
 import json
-from typing import Optional
 
 import torch
 
@@ -172,7 +171,7 @@ def apply_ablation(args: argparse.Namespace, trainer: AdvAugmentTrainer) -> None
         def fixed_lam_forward(input_ids, lambda_ceiling=0.8):
             T, pool_ids, lam = original_forward(input_ids, lambda_ceiling)
             B = input_ids.size(0)
-            fixed = torch.full((B, 1), 0.7, device=input_ids.device)
+            fixed = torch.full((B, 1), 0.5, device=input_ids.device)
             return T, pool_ids, fixed
 
         trainer.augmenter.forward = fixed_lam_forward

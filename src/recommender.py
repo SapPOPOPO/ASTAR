@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from modules import Encoder, LayerNorm, NCELoss
+from modules import Encoder, LayerNorm
 
 # Threshold below which an embedding's L1 norm is treated as a padding row
 # (used when inferring the padding mask from inputs_embeds).
