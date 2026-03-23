@@ -1,414 +1,278 @@
-"""
-main.py — Entry point for ASTAR training and evaluation.
+# -*- coding: utf-8 -*-
 
-Usage:
-    python main.py --data_path data/Beauty.txt --dataset Beauty
-    python main.py --data_path data/Sports.txt --dataset Sports --ablation intra
-    python main.py --data_path data/Yelp.txt   --dataset Yelp   --probe_only
-"""
-
-import argparse
 import os
-import sys
-import json
-
+import numpy as np
+import random
 import torch
+import argparse
 
-# Add src to path when running from repo root
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 
-from augmenter import ASTARAugmenter
-from datasets import build_dataloaders
-from diagnose import GANDiagnostics, probe_continuous_input
-from recommender import SASRec
-from trainers import AdvAugmentTrainer, CoSeRecTrainer
-from utils import set_seed
-from visualize import (
-    compute_intra_inter_ratio,
-    visualize_T,
-    visualize_intra_inter,
-    visualize_lambda,
-)
+from datasets import RecWithContrastiveLearningDataset
+from trainers import CoSeRecTrainer, ASTARTrainer
+from models import SASRecModel, OfflineItemSimilarity, OnlineItemSimilarity
+from ASTAR import Augmenter
+from utils import EarlyStopping, get_user_seqs, get_item2attribute_json, check_path, set_seed
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Argument parser
-# ─────────────────────────────────────────────────────────────────────────────
+def show_args_info(args):
+    print(f"--------------------Configure Info:------------")
+    for arg in vars(args):
+        val = getattr(args, arg)
+        try:
+            print(f"{arg:<30} : {val:>35}")
+        except TypeError:
+            print(f"{arg:<30} : {str(val):>35}")
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="ASTAR: Adversarial Sequential Transformation Augmentation for Recommendation"
-    )
+def main():
+    parser = argparse.ArgumentParser()
 
-    # Data
-    p.add_argument("--data_path", type=str, required=True,
-                   help="Path to interaction file (space-separated user item [ts])")
-    p.add_argument("--dataset", type=str, default="dataset",
-                   help="Dataset name (used for logging and save paths)")
-    p.add_argument("--max_seq_len", type=int, default=50)
+    # system args
+    parser.add_argument('--data_dir',    default='data/', type=str)
+    parser.add_argument('--output_dir',  default='output/',   type=str)
+    parser.add_argument('--data_name',   default='Beauty',    type=str)
+    parser.add_argument('--do_eval',     action='store_true')
+    parser.add_argument('--model_idx',   default=3,           type=int)
+    parser.add_argument('--gpu_id',      default='0',         type=str)
 
-    # Model architecture
-    p.add_argument("--hidden_size", type=int, default=256)
-    p.add_argument("--num_heads", type=int, default=2)
-    p.add_argument("--num_layers", type=int, default=2)
-    p.add_argument("--inner_size", type=int, default=512)
-    p.add_argument("--dropout", type=float, default=0.1)
+    # model selector
+    parser.add_argument('--model_name',  default='ASTAR',   type=str,
+                        help='CoSeRec or ASTAR')
 
-    # Augmenter
-    p.add_argument("--K", type=int, default=4,
-                   help="Number of inter-sequence samples per example")
-    p.add_argument("--tau_init", type=float, default=10.0)
-    p.add_argument("--tau_floor", type=float, default=1.0)
-    p.add_argument("--tau_decay", type=float, default=0.99)
+    # data augmentation args
+    parser.add_argument('--noise_ratio',             default=0.0,          type=float)
+    parser.add_argument('--training_data_ratio',     default=1.0,          type=float)
+    parser.add_argument('--augment_threshold',       default=5,            type=int)
+    parser.add_argument('--similarity_model_name',   default='ItemCF_IUF', type=str)
+    parser.add_argument('--augmentation_warm_up_epoches', default=400,     type=float)
+    parser.add_argument('--base_augment_type',       default='mask',       type=str)
+    parser.add_argument('--augment_type_for_short',  default='SIM',        type=str)
+    parser.add_argument('--tao',                     default=0.2,          type=float)
+    parser.add_argument('--gamma',                   default=0.7,          type=float)
+    parser.add_argument('--beta',                    default=0.2,          type=float)
+    parser.add_argument('--substitute_rate',         default=0.1,          type=float)
+    parser.add_argument('--insert_rate',             default=0.4,          type=float)
+    parser.add_argument('--max_insert_num_per_pos',  default=1,            type=int)
 
-    # Training
-    p.add_argument("--batch_size", type=int, default=256)
-    p.add_argument("--num_epochs", type=int, default=200)
-    p.add_argument("--patience", type=int, default=20)
-    p.add_argument("--warmup_epochs", type=int, default=20)
-    p.add_argument("--rec_lr", type=float, default=1e-3)
-    p.add_argument("--aug_lr", type=float, default=1e-3)
-    p.add_argument("--weight_decay", type=float, default=1e-5)
+    # contrastive learning args
+    parser.add_argument('--temperature', default=1.0,  type=float)
+    parser.add_argument('--n_views',     default=2,    type=int)
 
-    # Loss weights
-    p.add_argument("--gamma", type=float, default=0.1,
-                   help="Weight of L_rec_aug in recommender loss")
-    p.add_argument("--lambda_cl", type=float, default=0.1,
-                   help="Weight of contrastive loss in recommender loss")
-    p.add_argument("--alpha", type=float, default=1.0,
-                   help="Weight of -L_contrast in augmenter loss")
-    p.add_argument("--beta", type=float, default=1.0,
-                   help="Weight of L_rec_aug in augmenter loss")
-    p.add_argument("--cl_temperature", type=float, default=0.07)
+    # model args
+    parser.add_argument('--hidden_size',                  default=64,     type=int)
+    parser.add_argument('--num_hidden_layers',            default=2,      type=int)
+    parser.add_argument('--num_attention_heads',          default=2,      type=int)
+    parser.add_argument('--hidden_act',                   default='gelu', type=str)
+    parser.add_argument('--attention_probs_dropout_prob', default=0.5,    type=float)
+    parser.add_argument('--hidden_dropout_prob',          default=0.5,    type=float)
+    parser.add_argument('--initializer_range',            default=0.02,   type=float)
+    parser.add_argument('--max_seq_length',               default=50,     type=int)
 
-    # Evaluation
-    p.add_argument("--ks", type=int, nargs="+", default=[5, 10, 20],
-                   help="Cut-offs for HR@K and NDCG@K")
+    # train args
+    parser.add_argument('--lr',           default=0.001, type=float)
+    parser.add_argument('--batch_size',   default=256,   type=int)
+    parser.add_argument('--epochs',       default=400,   type=int)
+    parser.add_argument('--no_cuda',      action='store_true')
+    parser.add_argument('--log_freq',     default=1,     type=int)
+    parser.add_argument('--seed',         default=1,     type=int)
+    parser.add_argument('--cf_weight',    default=0.25,   type=float)
+    parser.add_argument('--rec_weight',   default=1.0,   type=float)
+    parser.add_argument('--weight_decay', default=0.0,   type=float)
+    parser.add_argument('--adam_beta1',   default=0.9,   type=float)
+    parser.add_argument('--adam_beta2',   default=0.999, type=float)
 
-    # Ablations
-    p.add_argument(
-        "--ablation",
-        type=str,
-        default="full",
-        choices=["full", "intra", "inter", "fixed_lambda", "no_adv"],
-        help=(
-            "full:         complete ASTAR model\n"
-            "intra:        T operates on own sequence only (K=0)\n"
-            "inter:        T operates on other sequences only (no own sequence)\n"
-            "fixed_lambda: λ fixed at 0.5, not learned\n"
-            "no_adv:       no adversarial game, T trained cooperatively"
-        ),
-    )
+    # ASTAR-specific args
+    parser.add_argument('--reclp_weight',  default=0.4,  type=float,
+                        help='weight of last-position rec loss in recommender phase')
+    parser.add_argument('--alpha',         default=0.1,  type=float,
+                        help='augmenter adversarial weight')
+    parser.add_argument('--astar_beta',    default=1.0,  type=float,
+                        help='augmenter preservation weight')
+    parser.add_argument('--warmup_epochs', default=0,   type=int,
+                        help='epochs before adversarial game starts')
+    parser.add_argument('--max_grad_norm', default=5.0,  type=float)
+    parser.add_argument('--aug_tau',       default=2.0,  type=float,
+                        help='initial augmenter temperature')
+    parser.add_argument('--aug_tau_decay', default=0.99, type=float)
+    parser.add_argument('--aug_min_tau',   default=0.5,  type=float)
+    parser.add_argument('--N_rand',        default=20,   type=int,
+                        help='number of random substitution candidates in pool')
+    parser.add_argument('--N_sim',         default=0,   type=int,
+                        help='number of similarity-based candidates in pool (0=disabled)')
+    parser.add_argument('--N_hist',        default=0,   type=int,
+                        help='number of user history candidates in pool (0=disabled)')
+    parser.add_argument('--use_item_similarity', action='store_true',
+                        help='use precomputed item similarity for pool')
 
-    # Misc
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--device", type=str, default="auto",
-                   help="'auto', 'cpu', 'cuda', 'cuda:0', etc.")
-    p.add_argument("--num_workers", type=int, default=4)
-    p.add_argument("--save_dir", type=str, default="checkpoints")
-    p.add_argument("--plot_dir", type=str, default="plots")
-    p.add_argument("--log_interval", type=int, default=1)
-    p.add_argument("--probe_only", action="store_true",
-                   help="Run continuous-input diagnostic probe and exit")
-    p.add_argument("--visualize_only", action="store_true",
-                   help="Load checkpoint and run visualisations only")
-    p.add_argument("--checkpoint", type=str, default=None,
-                   help="Path to checkpoint to load for evaluation / visualisation")
-    p.add_argument("--verbose", action="store_true", default=True)
-    p.add_argument("--no_verbose", dest="verbose", action="store_false")
-
-    # Model selection
-    p.add_argument(
-        "--model",
-        type=str,
-        default="astar",
-        choices=["astar", "cosrec"],
-        help="Model to train: 'astar' (default) or 'cosrec' (CoSeRec baseline)",
-    )
-
-    return p.parse_args()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Model builder
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def build_models(args: argparse.Namespace, num_items: int, device: torch.device):
-    """Instantiate recommender and augmenter."""
-    K = 0 if args.ablation == "intra" else args.K
-
-    recommender = SASRec(
-        num_items=num_items,
-        hidden_size=args.hidden_size,
-        max_seq_len=args.max_seq_len,
-        num_heads=args.num_heads,
-        num_layers=args.num_layers,
-        inner_size=args.inner_size,
-        dropout=args.dropout,
-    ).to(device)
-
-    augmenter = ASTARAugmenter(
-        num_items=num_items,
-        hidden_size=args.hidden_size,
-        max_seq_len=args.max_seq_len,
-        num_heads=args.num_heads,
-        num_layers=args.num_layers,
-        inner_size=args.inner_size,
-        dropout=args.dropout,
-        K=K,
-        tau_init=args.tau_init,
-        tau_floor=args.tau_floor,
-        tau_decay=args.tau_decay,
-    ).to(device)
-
-    return recommender, augmenter
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Ablation modifications
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def apply_ablation(args: argparse.Namespace, trainer: AdvAugmentTrainer) -> None:
-    """Patch trainer / augmenter for ablation studies."""
-    if args.ablation == "fixed_lambda":
-        # Monkey-patch the augmenter forward to fix λ at 0.5
-        original_forward = trainer.augmenter.forward
-
-        def fixed_lam_forward(input_ids, lambda_ceiling=0.8):
-            T, pool_ids, lam = original_forward(input_ids, lambda_ceiling)
-            B = input_ids.size(0)
-            fixed = torch.full((B, 1), 0.5, device=input_ids.device)
-            return T, pool_ids, fixed
-
-        trainer.augmenter.forward = fixed_lam_forward
-
-    elif args.ablation == "no_adv":
-        # Cooperative training: augmenter also minimises contrast loss (no negation)
-        original_phase2 = trainer._phase2_aug
-
-        def cooperative_phase2(input_ids, target_pos, target_neg):
-            trainer.recommender.eval()
-            trainer.augmenter.train()
-            trainer.aug_optimizer.zero_grad()
-
-            T, pool_ids, lam = trainer.augmenter(input_ids, trainer.lambda_ceiling)
-            with torch.no_grad():
-                repr_orig = trainer.recommender.get_representation(input_ids=input_ids)
-            pool_emb = trainer.recommender.item_embeddings(pool_ids).detach()
-            org_emb = trainer.recommender.item_embeddings(input_ids).detach()
-            aug_emb = torch.einsum('bpl,bpd->bld', T, pool_emb)
-            mixed = lam.unsqueeze(-1) * aug_emb + (1 - lam.unsqueeze(-1)) * org_emb
-            repr_aug = trainer.recommender.get_representation(inputs_embeds=mixed)
-            L_rec_aug = trainer.recommender.rec_loss(repr_aug, target_pos, target_neg)
-            # Cooperative: minimise contrast (no negation)
-            L_contrast = trainer.nce_loss(repr_orig.detach(), repr_aug)
-            L_A = trainer.beta * L_rec_aug + trainer.alpha * L_contrast
-            L_A.backward()
-            torch.nn.utils.clip_grad_norm_(trainer.augmenter.parameters(), trainer.grad_clip_norm)
-            trainer.aug_optimizer.step()
-            return {
-                "L_rec_aug_A": L_rec_aug.item(),
-                "L_contrast_A": L_contrast.item(),
-                "L_A": L_A.item(),
-                "lambda_mean": lam.mean().item(),
-            }
-
-        trainer._phase2_aug = cooperative_phase2
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def main() -> None:
-    args = parse_args()
-
-    # Device
-    if args.device == "auto":
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = torch.device(args.device)
-    print(f"Using device: {device}")
+    args = parser.parse_args()
 
     set_seed(args.seed)
+    check_path(args.output_dir)
 
-    # ── Data ──────────────────────────────────────────────────────────────
-    train_loader, valid_loader, test_loader, num_users, num_items = build_dataloaders(
-        data_path=args.data_path,
-        max_seq_len=args.max_seq_len,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        seed=args.seed,
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
+    args.cuda_condition = torch.cuda.is_available() and not args.no_cuda
+    print("Using Cuda:", torch.cuda.is_available())
+    args.data_file = args.data_dir + args.data_name + '.txt'
+
+    user_seq, max_item, valid_rating_matrix, test_rating_matrix = \
+        get_user_seqs(args.data_file)
+
+    args.item_size = max_item + 2
+    args.mask_id   = 0
+
+    # save model args
+    args_str           = f'{args.model_name}-{args.data_name}-{args.model_idx}'
+    args.log_file      = os.path.join(args.output_dir, args_str + '.txt')
+    args.train_matrix  = valid_rating_matrix
+    checkpoint         = args_str + '.pt'
+    args.checkpoint_path = os.path.join(args.output_dir, checkpoint)
+
+    show_args_info(args)
+    with open(args.log_file, 'a') as f:
+        f.write(str(args) + '\n')
+
+    # ── Item similarity precomputation ────────────────────────────────────────
+    args.similarity_model_path = os.path.join(
+        args.data_dir,
+        args.data_name + '_' + args.similarity_model_name + '_similarity.pkl'
     )
-    print(f"Dataset: {args.dataset}  |  users={num_users}  items={num_items}")
-    print(f"  train={len(train_loader.dataset)}  valid={len(valid_loader.dataset)}  test={len(test_loader.dataset)}")
+    offline_similarity_model = OfflineItemSimilarity(
+        data_file=args.data_file,
+        similarity_path=args.similarity_model_path,
+        model_name=args.similarity_model_name,
+        dataset_name=args.data_name
+    )
+    args.offline_similarity_model = offline_similarity_model
 
-    # ── Models ────────────────────────────────────────────────────────────
-    if args.model == "cosrec":
-        recommender = SASRec(
-            num_items=num_items,
-            hidden_size=args.hidden_size,
-            max_seq_len=args.max_seq_len,
-            num_heads=args.num_heads,
-            num_layers=args.num_layers,
-            inner_size=args.inner_size,
-            dropout=args.dropout,
-        ).to(device)
-        augmenter = None
-        print(f"Recommender params: {sum(p.numel() for p in recommender.parameters()):,}")
+    online_similarity_model = OnlineItemSimilarity(item_size=args.item_size)
+    args.online_similarity_model = online_similarity_model
+
+    # ── ASTAR: precompute item similarity tensor for pool ─────────────────────
+    args.item_similarity = None
+    if args.model_name == 'ASTAR' and args.use_item_similarity and args.N_sim > 0:
+        print("Precomputing item similarity tensor for ASTAR pool...")
+        top_k      = args.N_sim
+        sim_matrix = []
+        for item_id in range(args.item_size):
+            top_k_items = offline_similarity_model.most_similar(item_id, top_k=top_k)
+            sim_matrix.append(top_k_items)
+        args.item_similarity = torch.tensor(
+            sim_matrix, dtype=torch.long
+        )
+        if args.cuda_condition:
+            args.item_similarity = args.item_similarity.cuda()
+        print(f"Item similarity tensor: {args.item_similarity.shape}")
+
+    # ── Dataloaders ───────────────────────────────────────────────────────────
+    train_dataset = RecWithContrastiveLearningDataset(
+        args,
+        user_seq[:int(len(user_seq) * args.training_data_ratio)],
+        data_type='train'
+    )
+    train_sampler    = RandomSampler(train_dataset)
+    train_dataloader = DataLoader(
+        train_dataset, sampler=train_sampler, batch_size=args.batch_size
+    )
+
+    eval_dataset     = RecWithContrastiveLearningDataset(args, user_seq, data_type='valid')
+    eval_sampler     = SequentialSampler(eval_dataset)
+    eval_dataloader  = DataLoader(
+        eval_dataset, sampler=eval_sampler, batch_size=args.batch_size
+    )
+
+    test_dataset     = RecWithContrastiveLearningDataset(args, user_seq, data_type='test')
+    test_sampler     = SequentialSampler(test_dataset)
+    test_dataloader  = DataLoader(
+        test_dataset, sampler=test_sampler, batch_size=args.batch_size
+    )
+
+    # ── Model + Trainer ───────────────────────────────────────────────────────
+    model = SASRecModel(args=args)
+
+    if args.model_name == 'ASTAR':
+        # Pass ASTAR-specific args to augmenter
+        args.tau       = args.aug_tau
+        args.tau_decay = args.aug_tau_decay
+        args.min_tau   = args.aug_min_tau
+        args.beta      = args.astar_beta   # augmenter beta (not CoSeRec beta)
+
+        adv_model = Augmenter(args, N_rand=args.N_rand, N_sim=args.N_sim, N_hist=args.N_hist)
+
+        trainer = ASTARTrainer(
+            model, adv_model,
+            train_dataloader, eval_dataloader, test_dataloader,
+            args
+        )
+        print(f'Train ASTAR')
+
     else:
-        recommender, augmenter = build_models(args, num_items, device)
-        print(f"Recommender params: {sum(p.numel() for p in recommender.parameters()):,}")
-        print(f"Augmenter params:   {sum(p.numel() for p in augmenter.parameters()):,}")
+        # CoSeRec: adv_model is a dummy placeholder to satisfy Trainer signature
+        adv_model = SASRecModel(args=args)
 
-    # Load checkpoint if provided
-    if args.checkpoint:
-        ckpt = torch.load(args.checkpoint, map_location=device)
-        recommender.load_state_dict(ckpt["recommender"])
-        if augmenter is not None and "augmenter" in ckpt:
-            augmenter.load_state_dict(ckpt["augmenter"])
-        print(f"Loaded checkpoint: {args.checkpoint}")
-
-    # ── Diagnostic probe ──────────────────────────────────────────────────
-    if args.probe_only:
-        batch = next(iter(train_loader))
-        input_ids = batch["input_ids"].to(device)
-        probe_continuous_input(recommender, input_ids, device, L=args.max_seq_len)
-        return
-
-    # ── Visualise only ────────────────────────────────────────────────────
-    if args.visualize_only:
-        if augmenter is None:
-            print("[warn] --visualize_only is only supported for --model astar")
-            return
-        plot_dir = os.path.join(args.plot_dir, args.dataset)
-        visualize_T(augmenter, test_loader, device,
-                    save_path=os.path.join(plot_dir, "T_heatmap.png"))
-        visualize_lambda(augmenter, test_loader, device,
-                         save_path=os.path.join(plot_dir, "lambda_dist.png"))
-        intra, inter = compute_intra_inter_ratio(augmenter, test_loader, device)
-        print(f"Intra: {intra:.4f}  Inter: {inter:.4f}")
-        return
-
-    # ── CoSeRec path ──────────────────────────────────────────────────────
-    if args.model == "cosrec":
-        optimizer = torch.optim.Adam(
-            recommender.parameters(),
-            lr=args.rec_lr,
-            weight_decay=args.weight_decay,
-        )
-        save_dir = os.path.join(args.save_dir, args.dataset, "cosrec")
         trainer = CoSeRecTrainer(
-            recommender=recommender,
-            optimizer=optimizer,
-            device=device,
-            max_seq_len=args.max_seq_len,
-            lambda_cl=args.lambda_cl,
-            cl_temperature=args.cl_temperature,
+            model, adv_model,
+            train_dataloader, eval_dataloader, test_dataloader,
+            args
         )
+        print(f'Train CoSeRec')
 
-        test_metrics = trainer.fit(
-            train_loader=train_loader,
-            valid_loader=valid_loader,
-            test_loader=test_loader,
-            num_epochs=args.num_epochs,
-            patience=args.patience,
-            save_dir=save_dir,
-            verbose=args.verbose,
-            log_interval=args.log_interval,
-        )
+    # ── Training / Evaluation ─────────────────────────────────────────────────
+    if args.do_eval:
+        trainer.args.train_matrix = test_rating_matrix
+        trainer.load(args.checkpoint_path)
+        print(f'Load model from {args.checkpoint_path} for test!')
+        scores, result_info = trainer.test(0, full_sort=True)
 
-        results = {
-            "dataset": args.dataset,
-            "model": "cosrec",
-            "seed": args.seed,
-            "test_metrics": test_metrics,
-            "args": vars(args),
-        }
-        os.makedirs(save_dir, exist_ok=True)
-        result_path = os.path.join(save_dir, "results.json")
-        with open(result_path, "w") as f:
-            json.dump(results, f, indent=2)
-        print(f"\nResults saved → {result_path}")
-        return
+    else:
+        early_stopping = EarlyStopping(args.checkpoint_path, patience=40, verbose=True)
+        for epoch in range(args.epochs):
+            trainer.train(epoch)
+            scores, _ = trainer.valid(epoch, full_sort=True)
+            early_stopping(np.array(scores[-1:]), trainer.model)
+            if early_stopping.early_stop:
+                print("Early stopping")
+                break
 
-    # ── Optimisers ────────────────────────────────────────────────────────
-    rec_optimizer = torch.optim.Adam(
-        recommender.parameters(),
-        lr=args.rec_lr,
-        weight_decay=args.weight_decay,
+        trainer.args.train_matrix = test_rating_matrix
+        print('---------------Change to test_rating_matrix!-------------------')
+        trainer.model.load_state_dict(torch.load(args.checkpoint_path))
+        scores, result_info = trainer.test(0, full_sort=True)
+
+    print(args_str)
+    print(result_info)
+    with open(args.log_file, 'a') as f:
+        f.write(args_str + '\n')
+        f.write(result_info + '\n')
+    
+    trainer.analyzer.plot(
+        save_dir=os.path.join(args.output_dir, 'plots'),
+        dataset_name=args.data_name
     )
-    aug_optimizer = torch.optim.Adam(
-        augmenter.parameters(),
-        lr=args.aug_lr,
-        weight_decay=args.weight_decay,
-    )
+    trainer.analyzer.print_summary(dataset_name=args.data_name)
 
-    # ── Trainer ───────────────────────────────────────────────────────────
-    save_dir = os.path.join(args.save_dir, args.dataset, args.ablation)
-    trainer = AdvAugmentTrainer(
-        recommender=recommender,
-        augmenter=augmenter,
-        rec_optimizer=rec_optimizer,
-        aug_optimizer=aug_optimizer,
-        device=device,
-        gamma=args.gamma,
-        lambda_cl=args.lambda_cl,
-        alpha=args.alpha,
-        beta=args.beta,
-        cl_temperature=args.cl_temperature,
-        warmup_epochs=args.warmup_epochs,
-    )
+main()
 
-    # Apply ablation patches
-    apply_ablation(args, trainer)
+"""
+1. Added --model_name ASTAR selector
+   CoSeRec: original behaviour unchanged
+   ASTAR:   builds Augmenter, uses ASTARTrainer
 
-    # ── Run diagnostic probe before training ──────────────────────────────
-    sample_batch = next(iter(train_loader))
-    sample_ids = sample_batch["input_ids"].to(device)
-    probe_result = probe_continuous_input(recommender, sample_ids, device, L=args.max_seq_len)
+2. Added all ASTAR-specific args:
+   --reclp_weight, --alpha, --astar_beta, --warmup_epochs
+   --aug_tau, --aug_tau_decay, --aug_min_tau
+   --N_rand, --N_sim, --use_item_similarity
 
-    # ── Train ─────────────────────────────────────────────────────────────
-    test_metrics = trainer.fit(
-        train_loader=train_loader,
-        valid_loader=valid_loader,
-        test_loader=test_loader,
-        num_epochs=args.num_epochs,
-        patience=args.patience,
-        save_dir=save_dir,
-        verbose=args.verbose,
-        log_interval=args.log_interval,
-    )
+3. Item similarity tensor precomputed once before training
+   Only when --model_name ASTAR --use_item_similarity --N_sim > 0
+   Stored in args.item_similarity → passed to augmenter forward
 
-    # ── Save results ──────────────────────────────────────────────────────
-    results = {
-        "dataset": args.dataset,
-        "ablation": args.ablation,
-        "seed": args.seed,
-        "probe": probe_result,
-        "test_metrics": test_metrics,
-        "args": vars(args),
-    }
-    os.makedirs(save_dir, exist_ok=True)
-    result_path = os.path.join(save_dir, "results.json")
-    with open(result_path, "w") as f:
-        json.dump(results, f, indent=2)
-    print(f"\nResults saved → {result_path}")
+4. CoSeRec: adv_model is a dummy SASRecModel
+   Satisfies Trainer signature without changing CoSeRec logic
 
-    # ── Visualisations ────────────────────────────────────────────────────
-    plot_dir = os.path.join(args.plot_dir, args.dataset, args.ablation)
-    try:
-        visualize_T(augmenter, test_loader, device,
-                    save_path=os.path.join(plot_dir, "T_heatmap.png"))
-        visualize_lambda(augmenter, test_loader, device,
-                         save_path=os.path.join(plot_dir, "lambda_dist.png"))
-    except Exception as exc:
-        print(f"[warn] Visualisation failed: {exc}")
+5. Run ASTAR:
+   python main.py --model_name ASTAR --data_name Beauty
 
-
-if __name__ == "__main__":
-    main()
+   Run CoSeRec (unchanged):
+   python main.py --model_name CoSeRec --data_name Beauty
+"""

@@ -1,563 +1,647 @@
 """
-trainers.py — Two-phase adversarial training for ASTAR.
+trainers.py — ASTAR adversarial training on top of CoSeRec pipeline.
 
-Training protocol per batch:
-    Phase 1: Update Recommender (augmenter frozen)
-        - Generate aug from augmenter (no_grad)
-        - Compute L_B = L_rec_orig + γ·L_rec_aug + λ_cl·L_contrast
-        - Update recommender parameters
+Inherits CoSeRecTrainer structure exactly.
+Only change: augmentation is replaced by ASTAR's learned T matrix.
 
-    Phase 2: Update Augmenter (recommender frozen)
-        - Re-generate aug (with gradients)
-        - Compute L_A = β·L_rec_aug − α·L_contrast
-        - Update augmenter parameters
+Key differences from CoSeRecTrainer:
+    1. Two models: recommender (model) + augmenter (adv_model)
+    2. Two-phase training per batch:
+           Phase 1: recommender update (augmenter frozen, hard T)
+           Phase 2: augmenter update  (recommender frozen, soft T)
+    3. λ-adjusted contrastive loss (harder augmentation → higher weight)
+    4. Warmup: augmenter starts after warmup_epochs (default 20)
+               before warmup: recommender trains on original sequence only
+               after warmup:  full adversarial game
 
-Warmup strategy:
-    Epochs 0..warmup_epochs: λ_ceiling=0.4 (conservative)
-    After warmup: full adversarial game with adaptive λ_ceiling
+Loss Functions:
+    Recommender (Phase 1):
+        L_B = rec_weight   * L_rec_orig
+            + reclp_weight * L_rec_org
+            + cf_weight    * λ_mean * L_contrast(hard_aug, org_seq)
+
+        where:
+            L_rec_orig:    cross_entropy on original sequence [B, L] supervision
+            L_rec_org:     cross_entropy on original sequence last position
+            L_contrast:    InfoNCE between hard augmented and original views
+            λ_mean:        mean λ across batch (adjusts contrast loss weight)
+
+    Augmenter (Phase 2):
+        L_A = beta  * L_rec_aug(soft_mixed)
+            - alpha * L_contrast(soft_aug, org_seq)
+
+        where:
+            L_rec_aug:     cross_entropy on soft λ-blended view (last position)
+            L_contrast:    InfoNCE between soft and original views
+            beta, alpha:   hyperparameters controlling preservation vs diversity
+
+Contrastive Learning:
+    Original sequence vs augmented view.
+    Uses full sequence flatten [B, L*D] → NCELoss.
+    Consistent with CoSeRec's _one_pair_contrastive_learning.
+
+Warmup Strategy:
+    epoch < warmup_epochs:
+        Only recommender trains on original sequence
+        No augmentation, no adversarial game
+
+    epoch >= warmup_epochs:
+        Both phases run every batch
+        Full adversarial training
+
+Temperature:
+    augmenter.decay_tau() called once per epoch after warmup only.
+
+Evaluation:
+    Identical to CoSeRecTrainer.
+    Recommender evaluated on original sequences only.
+    No augmentation at inference.
+
+Hyperparameters (all from args):
+    rec_weight:    weight of original rec loss            (default 1.0)
+    cf_weight:     weight of contrastive loss             (default 0.1)
+    reclp_weight:  weight of last position rec loss       (default 0.1)
+    alpha:         augmenter adversarial weight           (default 1.0)
+    beta:          augmenter preservation weight          (default 0.5)
+    warmup_epochs: epochs before adversarial starts       (default 20)
 """
 
-import os
-import time
-from typing import Dict, List, Tuple
+import numpy as np
+from tqdm import tqdm
+import random
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.optim import Adam
 
-from augmenter import ASTARAugmenter
-from data_augmentation import Random as RandomAugmentor
-from modules import NCELoss
-from recommender import SASRec
-from utils import PerformanceTracker, aggregate_metrics, compute_metrics
+from torch.utils.data import DataLoader, RandomSampler
+from datasets import RecWithContrastiveLearningDataset
+from modules import NCELoss, NTXent
+from analyze_T import TMatrixAnalyzer
+from utils import recall_at_k, ndcg_k, get_metric, get_user_seqs, nCr
 
 
-class AdvAugmentTrainer:
-    """Adversarial Augmentation Trainer.
+class Trainer:
+    def __init__(self, model, adv_model,
+                 train_dataloader,
+                 eval_dataloader,
+                 test_dataloader,
+                 args):
 
-    Args:
-        recommender:    SASRec model
-        augmenter:      ASTARAugmenter model
-        rec_optimizer:  optimizer for recommender
-        aug_optimizer:  optimizer for augmenter
-        device:         torch device
-        gamma:          weight of L_rec_aug in recommender loss
-        lambda_cl:      weight of contrastive loss in recommender loss
-        alpha:          weight of -L_contrast in augmenter loss
-        beta:           weight of L_rec_aug in augmenter loss
-        cl_temperature: InfoNCE temperature
-        warmup_epochs:  epochs with conservative λ ceiling
-        perf_window:    window for performance trend computation
-    """
+        self.args           = args
+        self.cuda_condition = torch.cuda.is_available() and not self.args.no_cuda
+        self.device         = torch.device("cuda" if self.cuda_condition else "cpu")
 
-    def __init__(
-        self,
-        recommender: SASRec,
-        augmenter: ASTARAugmenter,
-        rec_optimizer: torch.optim.Optimizer,
-        aug_optimizer: torch.optim.Optimizer,
-        device: torch.device,
-        gamma: float = 0.01,
-        lambda_cl: float = 0.1,
-        alpha: float = 1.0,
-        beta: float = 0.5,
-        cl_temperature: float = 0.07,
-        warmup_epochs: int = 20,
-        perf_window: int = 5,
-    ) -> None:
-        self.recommender = recommender
-        self.augmenter = augmenter
-        self.rec_optimizer = rec_optimizer
-        self.aug_optimizer = aug_optimizer
-        self.device = device
+        self.model                   = model
+        self.adv_model               = adv_model
+        self.online_similarity_model = args.online_similarity_model
+        self.total_augmentaion_pairs = nCr(self.args.n_views, 2)
 
-        self.gamma = gamma
-        self.lambda_cl = lambda_cl
-        self.alpha = alpha
-        self.beta = beta
-        self.warmup_epochs = warmup_epochs
-        self.grad_clip_norm: float = 5.0  # gradient clipping threshold
+        self.analyzer = TMatrixAnalyzer(args, N_rand=args.N_rand, N_sim=args.N_sim)
 
-        self.nce_loss = NCELoss(temperature=cl_temperature)
-        self.perf_tracker = PerformanceTracker(window=perf_window)
+        self.projection = nn.Sequential(
+            nn.Linear(self.args.max_seq_length * self.args.hidden_size,
+                      512, bias=False),
+            nn.BatchNorm1d(512),
+            nn.ReLU(inplace=True),
+            nn.Linear(512, self.args.hidden_size, bias=True)
+        )
 
-        self._current_epoch = 0
+        if self.cuda_condition:
+            self.model.cuda()
+            self.projection.cuda()
 
-    # ── properties ─────────────────────────────────────────────────────────
+        self.train_dataloader = train_dataloader
+        self.eval_dataloader  = eval_dataloader
+        self.test_dataloader  = test_dataloader
 
-    @property
-    def is_warmup(self) -> bool:
-        return self._current_epoch <= self.warmup_epochs
+        betas          = (self.args.adam_beta1, self.args.adam_beta2)
+        self.optim     = Adam(self.model.parameters(), lr=self.args.lr,
+                              betas=betas, weight_decay=self.args.weight_decay)
+        self.optim_adv = Adam(self.adv_model.parameters(), lr=self.args.lr,
+                              betas=betas, weight_decay=self.args.weight_decay)
 
-    @property
-    def lambda_ceiling(self) -> float:
-        if self.is_warmup:
-            return 0.4
-        return self.perf_tracker.lambda_ceiling
+        print("Total Parameters:",
+              sum([p.nelement() for p in self.model.parameters()]))
 
-    # ── Phase 1: recommender update ───────────────────────────────────────
+        self.cf_criterion = NCELoss(self.args.temperature, self.device)
+        print("self.cf_criterion:", self.cf_criterion.__class__.__name__)
 
-    def _phase1_rec(
-        self,
-        input_ids: torch.Tensor,
-        target_pos: torch.Tensor,
-        target_neg: torch.Tensor,
-    ) -> Dict[str, float]:
-        """Update recommender parameters."""
-        self.recommender.train()
-        self.augmenter.eval()
-        self.rec_optimizer.zero_grad()
+    def __refresh_training_dataset(self, item_embeddings):
+        user_seq, _, _, _ = get_user_seqs(self.args.data_file)
+        self.args.online_similarity_model.update_embedding_matrix(item_embeddings)
+        train_dataset    = RecWithContrastiveLearningDataset(
+            self.args, user_seq,
+            data_type='train', similarity_model_type='hybrid'
+        )
+        train_sampler    = RandomSampler(train_dataset)
+        train_dataloader = DataLoader(
+            train_dataset, sampler=train_sampler,
+            batch_size=self.args.batch_size
+        )
+        return train_dataloader
 
-        # Generate T, pool_ids, lam without gradients (augmenter fixed)
+    def train(self, epoch):
+        if epoch > self.args.augmentation_warm_up_epoches:
+            print("refresh dataset with updated item embedding")
+            self.train_dataloader = self.__refresh_training_dataset(
+                self.model.item_embeddings
+            )
+        self.iteration(epoch, self.train_dataloader)
+
+    def valid(self, epoch, full_sort=False):
+        return self.iteration(epoch, self.eval_dataloader,
+                              full_sort=full_sort, train=False)
+
+    def test(self, epoch, full_sort=False):
+        return self.iteration(epoch, self.test_dataloader,
+                              full_sort=full_sort, train=False)
+
+    def iteration(self, epoch, dataloader, full_sort=False, train=True):
+        raise NotImplementedError
+
+    def get_sample_scores(self, epoch, pred_list):
+        pred_list = (-pred_list).argsort().argsort()[:, 0]
+        HIT_1, NDCG_1, MRR = get_metric(pred_list, 1)
+        HIT_5, NDCG_5, MRR = get_metric(pred_list, 5)
+        HIT_10, NDCG_10, MRR = get_metric(pred_list, 10)
+        post_fix = {
+            "Epoch": epoch,
+            "HIT@1":  '{:.4f}'.format(HIT_1),  "NDCG@1":  '{:.4f}'.format(NDCG_1),
+            "HIT@5":  '{:.4f}'.format(HIT_5),  "NDCG@5":  '{:.4f}'.format(NDCG_5),
+            "HIT@10": '{:.4f}'.format(HIT_10), "NDCG@10": '{:.4f}'.format(NDCG_10),
+            "MRR": '{:.4f}'.format(MRR),
+        }
+        print(post_fix)
+        with open(self.args.log_file, 'a') as f:
+            f.write(str(post_fix) + '\n')
+        return [HIT_1, NDCG_1, HIT_5, NDCG_5, HIT_10, NDCG_10, MRR], str(post_fix)
+
+    def get_full_sort_score(self, epoch, answers, pred_list):
+        recall, ndcg = [], []
+        for k in [5, 10, 15, 20]:
+            recall.append(recall_at_k(answers, pred_list, k))
+            ndcg.append(ndcg_k(answers, pred_list, k))
+        post_fix = {
+            "Epoch": epoch,
+            "HIT@5":  '{:.4f}'.format(recall[0]), "NDCG@5":  '{:.4f}'.format(ndcg[0]),
+            "HIT@10": '{:.4f}'.format(recall[1]), "NDCG@10": '{:.4f}'.format(ndcg[1]),
+            "HIT@20": '{:.4f}'.format(recall[3]), "NDCG@20": '{:.4f}'.format(ndcg[3]),
+        }
+        print(post_fix)
+        with open(self.args.log_file, 'a') as f:
+            f.write(str(post_fix) + '\n')
+        return [recall[0], ndcg[0], recall[1], ndcg[1], recall[3], ndcg[3]], str(post_fix)
+
+    def save(self, file_name):
+        torch.save(self.model.cpu().state_dict(), file_name)
+        self.model.to(self.device)
+
+    def load(self, file_name):
+        self.model.load_state_dict(torch.load(file_name))
+
+    def cross_entropy(self, seq_out, pos_ids, neg_ids):
+        pos_emb    = self.model.item_embeddings(pos_ids)
+        neg_emb    = self.model.item_embeddings(neg_ids)
+        pos        = pos_emb.view(-1, pos_emb.size(2))
+        neg        = neg_emb.view(-1, neg_emb.size(2))
+        seq_emb    = seq_out.view(-1, self.args.hidden_size)
+        pos_logits = torch.sum(pos * seq_emb, -1)
+        neg_logits = torch.sum(neg * seq_emb, -1)
+        # infer from actual input size instead of hardcoding max_seq_length
+        istarget   = (pos_ids > 0).view(-1).float()
+        loss = torch.sum(
+            -torch.log(torch.sigmoid(pos_logits) + 1e-24) * istarget -
+            torch.log(1 - torch.sigmoid(neg_logits) + 1e-24) * istarget
+        ) / torch.sum(istarget)
+        return loss
+
+    def predict_sample(self, seq_out, test_neg_sample):
+        test_item_emb = self.model.item_embeddings(test_neg_sample)
+        test_logits   = torch.bmm(test_item_emb,
+                                  seq_out.unsqueeze(-1)).squeeze(-1)
+        return test_logits
+
+    def predict_full(self, seq_out):
+        test_item_emb = self.model.item_embeddings.weight
+        rating_pred   = torch.matmul(seq_out, test_item_emb.transpose(0, 1))
+        return rating_pred
+
+    def _contrastive_from_embeds(self, mixed, input_ids_orig):
+        """
+        Contrastive loss: original sequence vs augmented view.
+        Uses full sequence flatten [B, L*D] — consistent with CoSeRec.
+
+        mixed:          [B, L, D]  augmented embeddings (hard or soft)
+        input_ids_orig: [B, L]     for attention mask
+        """
+        out_orig  = self.model.transformer_encoder(input_ids_orig)     # [B, L, D]
+        out_aug   = self.model.transformer_encoder_from_embeds(
+            mixed, input_ids_orig
+        )                                                               # [B, L, D]
+        flat_orig = out_orig.view(out_orig.shape[0], -1)               # [B, L*D]
+        flat_aug  = out_aug.view(out_aug.shape[0],  -1)                # [B, L*D]
+        return self.cf_criterion(flat_orig, flat_aug)
+
+
+class ASTARTrainer(Trainer):
+
+    def __init__(self, model, adv_model,
+                 train_dataloader,
+                 eval_dataloader,
+                 test_dataloader,
+                 args):
+        super(ASTARTrainer, self).__init__(
+            model, adv_model,
+            train_dataloader, eval_dataloader, test_dataloader,
+            args
+        )
+
+        self.alpha           = getattr(args, 'alpha',         1.0)
+        self.beta            = getattr(args, 'beta',          0.5)
+        self.warmup_epochs   = getattr(args, 'warmup_epochs', 20)
+        self.max_grad_norm   = getattr(args, 'max_grad_norm', 5.0)
+        self.item_similarity = getattr(args, 'item_similarity', None)
+
+        if self.cuda_condition:
+            self.adv_model.cuda()
+
+        self.analyzer = TMatrixAnalyzer(args, N_rand=args.N_rand, N_sim=args.N_sim)
+
+    # ── Phase 1: Recommender update ──────────────────────────────────────────
+
+    def _phase1_recommender(self, input_ids, target_pos, target_neg, epoch):
+        """
+        Update recommender. Augmenter frozen. Hard T.
+
+        L_B = rec_weight   * L_rec_orig
+            + reclp_weight * L_rec_org
+            + cf_weight    * lam_mean * L_contrast(orig, hard_aug)
+        """
+        self.model.train()
+        self.adv_model.eval()
+        self.optim.zero_grad()
+
+        # ── Original sequence ─────────────────────────────────────────────────
+        seq_out_orig = self.model.transformer_encoder(input_ids)        # [B, L, D]
+        L_rec_orig   = self.cross_entropy(seq_out_orig, target_pos, target_neg)
+        L_rec_org    = self.cross_entropy(
+            seq_out_orig[:, -1:, :],
+            target_pos[:, -1:],
+            target_neg[:, -1:]
+        )
+
+        # ── Hard augmented view (no grad to augmenter) ────────────────────────
         with torch.no_grad():
-            T, pool_ids, lam = self.augmenter(input_ids, self.lambda_ceiling)
+            soft_mixed, hard_mixed, lam, T, own_mask = self.adv_model(
+                input_ids,
+                self.model.item_embeddings,
+                item_similarity=self.item_similarity,
+            )
+        lam_mean   = lam.mean().detach()
+        if epoch % 5 == 0:
+            self.analyzer.record(T, lam, own_mask, epoch)
 
-        # Hard Gumbel ST over pool dim=1 using masked logits (padding excluded)
-        hard_T = F.gumbel_softmax(
-            self.augmenter._last_T_logits_masked, tau=self.augmenter.tau, hard=True, dim=1
-        ).detach()
+        # ── Contrastive: orig vs hard aug ─────────────────────────────────────
+        L_contrast = self._contrastive_from_embeds(soft_mixed, input_ids)
 
-        # L_rec_orig: recommendation loss on original sequence
-        repr_orig, L_rec_orig = self.recommender(
-            input_ids=input_ids,
-            target_pos=target_pos,
-            target_neg=target_neg,
-        )
+        # ── Total ─────────────────────────────────────────────────────────────
+        L_B = (self.args.rec_weight    * L_rec_orig
+             + self.args.reclp_weight  * L_rec_org
+             + self.args.cf_weight     * lam_mean * L_contrast)
 
-        # L_rec_aug: recommendation consistency on hard-augmented view
-        repr_aug = self.recommender.get_mixed_representation(
-            input_ids, hard_T, pool_ids.detach(), lam.detach()
-        )
-        L_rec_aug = self.recommender.rec_loss(repr_aug, target_pos, target_neg)
-
-        # L_contrast: pull together orig and aug representations
-        L_contrast = self.nce_loss(repr_orig, repr_aug)
-
-        L_B = L_rec_orig + self.gamma * L_rec_aug + self.lambda_cl * L_contrast
         L_B.backward()
-        torch.nn.utils.clip_grad_norm_(self.recommender.parameters(), self.grad_clip_norm)
-        self.rec_optimizer.step()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+        self.optim.step()
 
         return {
-            "L_rec_orig": L_rec_orig.item(),
-            "L_rec_aug": L_rec_aug.item(),
-            "L_contrast": L_contrast.item(),
-            "L_B": L_B.item(),
+            'L_rec_orig': L_rec_orig.item(),
+            'L_rec_org':  L_rec_org.item(),
+            'L_contrast': L_contrast.item(),
+            'L_B':        L_B.item(),
+            'lam_mean':   lam_mean.item(),
         }
 
-    # ── Phase 2: augmenter update ─────────────────────────────────────────
+    # ── Phase 2: Augmenter update ─────────────────────────────────────────────
 
-    def _phase2_aug(
-        self,
-        input_ids: torch.Tensor,
-        target_pos: torch.Tensor,
-        target_neg: torch.Tensor,
-    ) -> Dict[str, float]:
-        """Update augmenter parameters."""
-        self.recommender.eval()
-        self.augmenter.train()
-        self.aug_optimizer.zero_grad()
+    def _phase2_augmenter(self, input_ids, target_pos, target_neg):
+        """
+        Update augmenter. Recommender parameters frozen. Soft T.
 
-        # Re-generate T, pool_ids, lam WITH gradients for augmenter
-        T, pool_ids, lam = self.augmenter(input_ids, self.lambda_ceiling)
+        L_A = beta  * L_rec_aug(soft_mixed)
+            - alpha * L_contrast(orig, soft_aug)
 
-        # repr_orig through frozen recommender (no grad needed)
-        with torch.no_grad():
-            repr_orig = self.recommender.get_representation(input_ids=input_ids)
+        Recommender parameters frozen via requires_grad_(False).
+        Gradient flows: loss → seq_out_aug → soft_mixed → T → augmenter.
+        """
+        self.model.eval()
+        self.adv_model.train()
+        self.optim_adv.zero_grad()
 
-        # Grad flows through T and lam (augmenter params) via the einsum and
-        # λ-blend inside get_mixed_representation; pool_ids is an integer tensor
-        # so no grad flows through index selection into recommender weights.
-        repr_aug = self.recommender.get_mixed_representation(input_ids, T, pool_ids, lam)
-        L_rec_aug = self.recommender.rec_loss(repr_aug, target_pos, target_neg)
+        # ── Freeze recommender parameters ─────────────────────────────────────
+        for param in self.model.parameters():
+            param.requires_grad_(False)
 
-        # L_contrast: maximise distance (adversarial)
-        L_contrast = self.nce_loss(repr_orig.detach(), repr_aug)
+        # ── Frozen original ───────────────────────────────────────────────────
+        seq_out_orig = self.model.transformer_encoder(input_ids)        # [B, L, D]
 
-        # Augmenter wants: preserve task info (beta * rec_loss) AND fool contrast (-alpha)
+        # ── Soft augmented view ───────────────────────────────────────────────
+        soft_mixed, hard_mixed, lam, T, own_mask = self.adv_model(
+            input_ids,
+            self.model.item_embeddings,
+            item_similarity=self.item_similarity,
+        )
+
+        # Gradient flows through soft_mixed → T → augmenter
+        # Recommender parameters frozen so they don't update
+        seq_out_aug = self.model.transformer_encoder_from_embeds(
+            soft_mixed, input_ids
+        )                                                               # [B, L, D]
+
+        # ── Rec loss: last position ───────────────────────────────────────────
+        L_rec_aug = self.cross_entropy(
+            seq_out_aug[:, -1:, :],
+            target_pos[:, -1:],
+            target_neg[:, -1:]
+        )
+
+        # ── Contrastive: augmenter maximizes distance from original ───────────
+        flat_orig = seq_out_orig.view(seq_out_orig.shape[0], -1)        # [B, L*D]
+        flat_aug  = seq_out_aug.view(seq_out_aug.shape[0],  -1)         # [B, L*D]
+        L_contrast = self.cf_criterion(flat_orig, flat_aug)
+
+        # ── Total augmenter loss ──────────────────────────────────────────────
         L_A = self.beta * L_rec_aug - self.alpha * L_contrast
+
         L_A.backward()
-        torch.nn.utils.clip_grad_norm_(self.augmenter.parameters(), self.grad_clip_norm)
-        self.aug_optimizer.step()
+        torch.nn.utils.clip_grad_norm_(self.adv_model.parameters(), self.max_grad_norm)
+        self.optim_adv.step()
+
+        # ── Unfreeze recommender for Phase 1 next batch ───────────────────────
+        for param in self.model.parameters():
+            param.requires_grad_(True)
 
         return {
-            "L_rec_aug_A": L_rec_aug.item(),
-            "L_contrast_A": L_contrast.item(),
-            "L_A": L_A.item(),
-            "lambda_mean": lam.mean().item(),
+            'L_rec_aug_A':  L_rec_aug.item(),
+            'L_contrast_A': L_contrast.item(),
+            'L_A':          L_A.item(),
         }
 
-    # ── epoch-level train ─────────────────────────────────────────────────
+    # ── Main iteration ────────────────────────────────────────────────────────
 
-    def train_epoch(
-        self,
-        train_loader: DataLoader,
-    ) -> Dict[str, float]:
-        """Run one training epoch (both phases).
+    def iteration(self, epoch, dataloader, full_sort=True, train=True):
+        str_code = "train" if train else "test"
 
-        Returns:
-            mean losses over batches
-        """
-        epoch_stats: List[Dict[str, float]] = []
+        if train:
+            self.model.train()
+            self.adv_model.train()
 
-        for batch in train_loader:
-            input_ids = batch["input_ids"].to(self.device)
-            target_pos = batch["target_pos"].to(self.device)
-            target_neg = batch["target_neg"].to(self.device)
+            metrics = {
+                'L_rec_orig':   0.0,
+                'L_rec_org':    0.0,
+                'L_contrast':   0.0,
+                'L_B':          0.0,
+                'lam_mean':     0.0,
+                'L_rec_aug_A':  0.0,
+                'L_contrast_A': 0.0,
+                'L_A':          0.0,
+            }
 
-            # Phase 1 – update recommender
-            stats1 = self._phase1_rec(input_ids, target_pos, target_neg)
+            is_warmup        = epoch < self.warmup_epochs
+            rec_cf_data_iter = tqdm(enumerate(dataloader), total=len(dataloader))
 
-            # Phase 2 – update augmenter
-            stats2 = self._phase2_aug(input_ids, target_pos, target_neg)
+            for i, (rec_batch, cl_batches) in rec_cf_data_iter:
+                rec_batch = tuple(t.to(self.device) for t in rec_batch)
+                _, input_ids, target_pos, target_neg, _ = rec_batch
 
-            combined = {**stats1, **stats2}
-            epoch_stats.append(combined)
-
-        return aggregate_metrics(epoch_stats)
-
-    # ── evaluation ────────────────────────────────────────────────────────
-
-    @torch.no_grad()
-    def evaluate(
-        self,
-        eval_loader: DataLoader,
-        ks: Tuple[int, ...] = (5, 10, 20),
-    ) -> Dict[str, float]:
-        """Full-ranking evaluation.
-
-        Returns:
-            dict of HR@K, NDCG@K metrics
-        """
-        self.recommender.eval()
-        batch_results = []
-
-        for batch in eval_loader:
-            input_ids = batch["input_ids"].to(self.device)
-            target_pos = batch["target_pos"].to(self.device)
-            train_history = batch.get("train_history", None)
-            if train_history is not None:
-                train_history = train_history.to(self.device)
-
-            repr_ = self.recommender.get_representation(input_ids=input_ids)
-            scores = self.recommender.score_all_items(repr_)
-
-            metrics = compute_metrics(scores, target_pos, ks=ks, train_history=train_history)
-            batch_results.append(metrics)
-
-        return aggregate_metrics(batch_results)
-
-    # ── full training loop ─────────────────────────────────────────────────
-
-    def fit(
-        self,
-        train_loader: DataLoader,
-        valid_loader: DataLoader,
-        test_loader: DataLoader,
-        num_epochs: int = 200,
-        patience: int = 20,
-        save_dir: str = "checkpoints",
-        verbose: bool = True,
-        log_interval: int = 1,
-    ) -> Dict[str, float]:
-        """Train ASTAR end-to-end.
-
-        Returns:
-            best metrics on test set (evaluated at best validation epoch)
-        """
-        os.makedirs(save_dir, exist_ok=True)
-        best_ndcg = -1.0
-        best_epoch = 0
-        patience_counter = 0
-        best_ckpt = os.path.join(save_dir, "best_model.pt")
-
-        for epoch in range(1, num_epochs + 1):
-            self._current_epoch = epoch
-
-            t0 = time.time()
-            train_stats = self.train_epoch(train_loader)
-            elapsed = time.time() - t0
-
-            # Step temperature (only after warmup)
-            self.augmenter.step_tau(warmup_active=self.is_warmup)
-
-            if epoch % log_interval == 0:
-                val_metrics = self.evaluate(valid_loader)
-                ndcg10 = val_metrics.get("NDCG@10", 0.0)
-
-                # Update performance tracker
-                self.perf_tracker.update(ndcg10)
-
-                if verbose:
-                    print(
-                        f"Epoch {epoch:4d} | "
-                        f"L_B={train_stats.get('L_B', 0):.4f} "
-                        f"L_A={train_stats.get('L_A', 0):.4f} "
-                        f"λ_mean={train_stats.get('lambda_mean', 0):.3f} "
-                        f"λ_ceil={self.lambda_ceiling:.2f} "
-                        f"tau={self.augmenter.tau:.2f} | "
-                        f"Val NDCG@10={ndcg10:.4f} | "
-                        f"t={elapsed:.1f}s"
+                if is_warmup:
+                    # Warmup: recommender trains on original sequence only
+                    self.model.train()
+                    self.optim.zero_grad()
+                    seq_out = self.model.transformer_encoder(input_ids)
+                    L_rec   = self.cross_entropy(seq_out, target_pos, target_neg)
+                    L_rec.backward()
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), self.max_grad_norm
                     )
+                    self.optim.step()
+                    metrics['L_rec_orig'] += L_rec.item()
+                    metrics['L_B']        += L_rec.item()
 
-                # Early stopping
-                if ndcg10 > best_ndcg:
-                    best_ndcg = ndcg10
-                    best_epoch = epoch
-                    patience_counter = 0
-                    # Save both models
-                    torch.save(
-                        {
-                            "epoch": epoch,
-                            "recommender": self.recommender.state_dict(),
-                            "augmenter": self.augmenter.state_dict(),
-                            "val_metrics": val_metrics,
-                        },
-                        best_ckpt,
-                    )
                 else:
-                    patience_counter += 1
-                    if patience_counter >= patience:
-                        if verbose:
-                            print(f"Early stopping at epoch {epoch} (best={best_epoch})")
-                        break
+                    # Full adversarial training
+                    stats1 = self._phase1_recommender(input_ids, target_pos, target_neg, epoch)
+                    stats2 = self._phase2_augmenter(input_ids, target_pos, target_neg)
+                    for k, v in {**stats1, **stats2}.items():
+                        if k in metrics:
+                            metrics[k] += v
 
-        # Load best model and evaluate on test set
-        if os.path.exists(best_ckpt):
-            ckpt = torch.load(best_ckpt, map_location=self.device)
-            self.recommender.load_state_dict(ckpt["recommender"])
-            if "augmenter" in ckpt:
-                self.augmenter.load_state_dict(ckpt["augmenter"])
-
-        test_metrics = self.evaluate(test_loader)
-        if verbose:
-            print(f"\nTest metrics (epoch {best_epoch}):")
-            for k, v in sorted(test_metrics.items()):
-                print(f"  {k}: {v:.4f}")
-
-        return test_metrics
-
-
-class CoSeRecTrainer:
-    """CoSeRec Trainer — CE + InfoNCE contrastive learning baseline.
-
-    Training protocol per batch:
-        - Apply two independent random augmentations to input_ids → aug_view_1, aug_view_2
-        - Compute representations: repr_orig, repr_aug1, repr_aug2
-        - L_ce = cross_entropy(score_all_items(repr_orig), target_pos)
-        - L_contrast = InfoNCE(repr_aug1, repr_aug2)
-        - L = L_ce + lambda_cl * L_contrast
-        - Single optimizer update
-
-    Args:
-        recommender:    SASRec model
-        optimizer:      optimizer for recommender
-        device:         torch device
-        max_seq_len:    maximum sequence length for padding
-        lambda_cl:      weight of contrastive loss
-        cl_temperature: InfoNCE temperature
-        aug_tao:        crop ratio
-        aug_gamma:      mask keep ratio
-        aug_beta:       reorder ratio
-    """
-
-    def __init__(
-        self,
-        recommender: SASRec,
-        optimizer: torch.optim.Optimizer,
-        device: torch.device,
-        max_seq_len: int = 50,
-        lambda_cl: float = 0.1,
-        cl_temperature: float = 0.07,
-        aug_tao: float = 0.2,
-        aug_gamma: float = 0.7,
-        aug_beta: float = 0.2,
-    ) -> None:
-        self.recommender = recommender
-        self.optimizer = optimizer
-        self.device = device
-        self.max_seq_len = max_seq_len
-        self.lambda_cl = lambda_cl
-        self.grad_clip_norm: float = 5.0
-
-        self.nce_loss = NCELoss(temperature=cl_temperature)
-        self.augmentor = RandomAugmentor(tao=aug_tao, gamma=aug_gamma, beta=aug_beta)
-
-    def _augment_batch(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Apply random augmentation to a batch of padded sequences.
-
-        Args:
-            input_ids: [B, L] left-padded sequences (zeros are padding)
-        Returns:
-            [B, L] augmented and re-padded sequences
-        """
-        B, L = input_ids.shape
-        rows = input_ids.tolist()
-        padded_rows = []
-
-        for row in rows:
-            # Strip padding zeros to get the raw item sequence
-            seq = [x for x in row if x != 0]
-
-            if len(seq) == 0:
-                padded_rows.append([0] * L)
-                continue
-
-            # Apply one random augmentation
-            aug_seq = self.augmentor(seq)
-
-            # Truncate to max_seq_len and left-pad with zeros
-            aug_seq = aug_seq[-self.max_seq_len:]
-            pad_len = L - len(aug_seq)
-            padded_rows.append([0] * pad_len + aug_seq)
-
-        return torch.tensor(padded_rows, dtype=input_ids.dtype, device=input_ids.device)
-
-    def train_epoch(self, train_loader: DataLoader) -> Dict[str, float]:
-        """Run one training epoch.
-
-        Returns:
-            mean losses over batches
-        """
-        self.recommender.train()
-        epoch_stats: List[Dict[str, float]] = []
-
-        for batch in train_loader:
-            input_ids = batch["input_ids"].to(self.device)
-            target_pos = batch["target_pos"].to(self.device)
-
-            self.optimizer.zero_grad()
-
-            # Two independent augmented views
-            aug_view_1 = self._augment_batch(input_ids)
-            aug_view_2 = self._augment_batch(input_ids)
-
-            # Compute sequence representations
-            repr_orig = self.recommender.get_representation(input_ids=input_ids)
-            repr_aug1 = self.recommender.get_representation(input_ids=aug_view_1)
-            repr_aug2 = self.recommender.get_representation(input_ids=aug_view_2)
-
-            # CE recommendation loss on original sequence (full softmax over all items)
-            scores = self.recommender.score_all_items(repr_orig)
-            L_ce = F.cross_entropy(scores, target_pos)
-
-            # InfoNCE contrastive loss between the two augmented views
-            L_contrast = self.nce_loss(repr_aug1, repr_aug2)
-
-            L = L_ce + self.lambda_cl * L_contrast
-            L.backward()
-            torch.nn.utils.clip_grad_norm_(self.recommender.parameters(), self.grad_clip_norm)
-            self.optimizer.step()
-
-            epoch_stats.append({
-                "L_ce": L_ce.item(),
-                "L_contrast": L_contrast.item(),
-                "L": L.item(),
-            })
-
-        return aggregate_metrics(epoch_stats)
-
-    @torch.no_grad()
-    def evaluate(
-        self,
-        eval_loader: DataLoader,
-        ks: Tuple[int, ...] = (5, 10, 20),
-    ) -> Dict[str, float]:
-        """Full-ranking evaluation with training-history masking.
-
-        Identical to AdvAugmentTrainer.evaluate().
-
-        Returns:
-            dict of HR@K, NDCG@K metrics
-        """
-        self.recommender.eval()
-        batch_results = []
-
-        for batch in eval_loader:
-            input_ids = batch["input_ids"].to(self.device)
-            target_pos = batch["target_pos"].to(self.device)
-            train_history = batch.get("train_history", None)
-            if train_history is not None:
-                train_history = train_history.to(self.device)
-
-            repr_ = self.recommender.get_representation(input_ids=input_ids)
-            scores = self.recommender.score_all_items(repr_)
-
-            metrics = compute_metrics(scores, target_pos, ks=ks, train_history=train_history)
-            batch_results.append(metrics)
-
-        return aggregate_metrics(batch_results)
-
-    def fit(
-        self,
-        train_loader: DataLoader,
-        valid_loader: DataLoader,
-        test_loader: DataLoader,
-        num_epochs: int = 200,
-        patience: int = 20,
-        save_dir: str = "checkpoints",
-        verbose: bool = True,
-        log_interval: int = 1,
-    ) -> Dict[str, float]:
-        """Train CoSeRec end-to-end with early stopping.
-
-        Returns:
-            best metrics on test set (evaluated at best validation epoch)
-        """
-        os.makedirs(save_dir, exist_ok=True)
-        best_ndcg = -1.0
-        best_epoch = 0
-        patience_counter = 0
-        best_ckpt = os.path.join(save_dir, "best_model.pt")
-
-        for epoch in range(1, num_epochs + 1):
-            t0 = time.time()
-            train_stats = self.train_epoch(train_loader)
-            elapsed = time.time() - t0
-
-            if epoch % log_interval == 0:
-                val_metrics = self.evaluate(valid_loader)
-                ndcg10 = val_metrics.get("NDCG@10", 0.0)
-
-                if verbose:
-                    print(
-                        f"Epoch {epoch:4d} | "
-                        f"L={train_stats.get('L', 0):.4f} "
-                        f"L_ce={train_stats.get('L_ce', 0):.4f} "
-                        f"L_contrast={train_stats.get('L_contrast', 0):.4f} | "
-                        f"Val NDCG@10={ndcg10:.4f} | "
-                        f"t={elapsed:.1f}s"
+                if i % 10 == 0:
+                    rec_cf_data_iter.set_description(
+                        f"Epoch {epoch} "
+                        f"{'[warmup]' if is_warmup else '[adv]'}: "
+                        f"L_B={metrics['L_B']/(i+1):.4f} "
+                        f"L_A={metrics['L_A']/(i+1):.4f} "
+                        f"λ={metrics['lam_mean']/(i+1):.3f}"
                     )
 
-                if ndcg10 > best_ndcg:
-                    best_ndcg = ndcg10
-                    best_epoch = epoch
-                    patience_counter = 0
-                    torch.save(
-                        {
-                            "epoch": epoch,
-                            "recommender": self.recommender.state_dict(),
-                            "val_metrics": val_metrics,
-                        },
-                        best_ckpt,
-                    )
-                else:
-                    patience_counter += 1
-                    if patience_counter >= patience:
-                        if verbose:
-                            print(f"Early stopping at epoch {epoch} (best={best_epoch})")
-                        break
+            # Decay tau after warmup only
+            if not is_warmup:
+                self.adv_model.decay_tau()
 
-        # Load best checkpoint and evaluate on test set
-        if os.path.exists(best_ckpt):
-            ckpt = torch.load(best_ckpt, map_location=self.device)
-            self.recommender.load_state_dict(ckpt["recommender"])
+            num_batches = len(dataloader)
+            for k in metrics:
+                metrics[k] /= num_batches
 
-        test_metrics = self.evaluate(test_loader)
-        if verbose:
-            print(f"\nTest metrics (epoch {best_epoch}):")
-            for k, v in sorted(test_metrics.items()):
-                print(f"  {k}: {v:.4f}")
+            post_fix = {
+                "epoch":        epoch,
+                "warmup":       is_warmup,
+                "L_rec_orig":   f"{metrics['L_rec_orig']:.4f}",
+                "L_rec_org":    f"{metrics['L_rec_org']:.4f}",
+                "L_contrast":   f"{metrics['L_contrast']:.4f}",
+                "L_B":          f"{metrics['L_B']:.4f}",
+                "lam_mean":     f"{metrics['lam_mean']:.4f}",
+                "L_rec_aug_A":  f"{metrics['L_rec_aug_A']:.4f}",
+                "L_contrast_A": f"{metrics['L_contrast_A']:.4f}",
+                "L_A":          f"{metrics['L_A']:.4f}",
+            }
 
-        return test_metrics
+            if (epoch + 1) % self.args.log_freq == 0:
+                print(str(post_fix))
+            with open(self.args.log_file, 'a') as f:
+                f.write(str(post_fix) + '\n')
+
+        else:
+            rec_data_iter = tqdm(
+                enumerate(dataloader),
+                desc="Recommendation EP_%s:%d" % (str_code, epoch),
+                total=len(dataloader),
+                bar_format="{l_bar}{r_bar}"
+            )
+            self.model.eval()
+            pred_list = None
+
+            if full_sort:
+                answer_list = None
+                for i, batch in rec_data_iter:
+                    batch = tuple(t.to(self.device) for t in batch)
+                    user_ids, input_ids, target_pos, target_neg, answers = batch
+                    recommend_output = self.model.transformer_encoder(input_ids)
+                    recommend_output = recommend_output[:, -1, :]
+                    rating_pred      = self.predict_full(recommend_output)
+                    rating_pred      = rating_pred.cpu().data.numpy().copy()
+                    batch_user_index = user_ids.cpu().numpy()
+                    rating_pred[self.args.train_matrix[batch_user_index].toarray() > 0] = 0
+                    ind             = np.argpartition(rating_pred, -20)[:, -20:]
+                    arr_ind         = rating_pred[np.arange(len(rating_pred))[:, None], ind]
+                    arr_ind_argsort = np.argsort(arr_ind)[np.arange(len(rating_pred)), ::-1]
+                    batch_pred_list = ind[np.arange(len(rating_pred))[:, None], arr_ind_argsort]
+                    if i == 0:
+                        pred_list   = batch_pred_list
+                        answer_list = answers.cpu().data.numpy()
+                    else:
+                        pred_list   = np.append(pred_list,   batch_pred_list, axis=0)
+                        answer_list = np.append(answer_list, answers.cpu().data.numpy(), axis=0)
+                return self.get_full_sort_score(epoch, answer_list, pred_list)
+
+            else:
+                for i, batch in rec_data_iter:
+                    batch = tuple(t.to(self.device) for t in batch)
+                    user_ids, input_ids, target_pos, target_neg, answers, sample_negs = batch
+                    recommend_output = self.model.finetune(input_ids)
+                    test_neg_items   = torch.cat((answers, sample_negs), -1)
+                    recommend_output = recommend_output[:, -1, :]
+                    test_logits      = self.predict_sample(recommend_output, test_neg_items)
+                    test_logits      = test_logits.cpu().detach().numpy().copy()
+                    if i == 0:
+                        pred_list = test_logits
+                    else:
+                        pred_list = np.append(pred_list, test_logits, axis=0)
+                return self.get_sample_scores(epoch, pred_list)
+
+
+class CoSeRecTrainer(Trainer):
+
+    def __init__(self, model, adv_model,
+                 train_dataloader,
+                 eval_dataloader,
+                 test_dataloader,
+                 args):
+        super(CoSeRecTrainer, self).__init__(
+            model, adv_model,
+            train_dataloader, eval_dataloader, test_dataloader,
+            args
+        )
+
+    def _one_pair_contrastive_learning(self, inputs):
+        cl_batch            = torch.cat(inputs, dim=0).to(self.device)
+        cl_sequence_output  = self.model.transformer_encoder(cl_batch)
+        cl_sequence_flatten = cl_sequence_output.view(cl_batch.shape[0], -1)
+        batch_size          = cl_batch.shape[0] // 2
+        cl_output_slice     = torch.split(cl_sequence_flatten, batch_size)
+        return self.cf_criterion(cl_output_slice[0], cl_output_slice[1])
+
+    def iteration(self, epoch, dataloader, full_sort=True, train=True):
+        str_code = "train" if train else "test"
+
+        if train:
+            self.model.train()
+            rec_avg_loss             = 0.0
+            cl_individual_avg_losses = [0.0 for _ in range(self.total_augmentaion_pairs)]
+            cl_sum_avg_loss          = 0.0
+            joint_avg_loss           = 0.0
+
+            print(f"rec dataset length: {len(dataloader)}")
+            rec_cf_data_iter = tqdm(enumerate(dataloader), total=len(dataloader))
+
+            for i, (rec_batch, cl_batches) in rec_cf_data_iter:
+                rec_batch = tuple(t.to(self.device) for t in rec_batch)
+                _, input_ids, target_pos, target_neg, _ = rec_batch
+
+                sequence_output = self.model.transformer_encoder(input_ids)
+                rec_loss        = self.cross_entropy(sequence_output, target_pos, target_neg)
+
+                cl_losses = []
+                for cl_batch in cl_batches:
+                    cl_loss = self._one_pair_contrastive_learning(cl_batch)
+                    cl_losses.append(cl_loss)
+
+                joint_loss = self.args.rec_weight * rec_loss
+                for cl_loss in cl_losses:
+                    joint_loss += self.args.cf_weight * cl_loss
+
+                self.optim.zero_grad()
+                joint_loss.backward()
+                self.optim.step()
+
+                rec_avg_loss += rec_loss.item()
+                for j, cl_loss in enumerate(cl_losses):
+                    cl_individual_avg_losses[j] += cl_loss.item()
+                    cl_sum_avg_loss             += cl_loss.item()
+                joint_avg_loss += joint_loss.item()
+
+            post_fix = {
+                "epoch":          epoch,
+                "rec_avg_loss":   '{:.4f}'.format(rec_avg_loss / len(rec_cf_data_iter)),
+                "joint_avg_loss": '{:.4f}'.format(joint_avg_loss / len(rec_cf_data_iter)),
+                "cl_avg_loss":    '{:.4f}'.format(
+                    cl_sum_avg_loss / (len(rec_cf_data_iter) * self.total_augmentaion_pairs)
+                ),
+            }
+            for j, cl_individual_avg_loss in enumerate(cl_individual_avg_losses):
+                post_fix[f'cl_pair_{j}_loss'] = '{:.4f}'.format(
+                    cl_individual_avg_loss / len(rec_cf_data_iter)
+                )
+
+            if (epoch + 1) % self.args.log_freq == 0:
+                print(str(post_fix))
+            with open(self.args.log_file, 'a') as f:
+                f.write(str(post_fix) + '\n')
+
+        else:
+            rec_data_iter = tqdm(
+                enumerate(dataloader),
+                desc="Recommendation EP_%s:%d" % (str_code, epoch),
+                total=len(dataloader),
+                bar_format="{l_bar}{r_bar}"
+            )
+            self.model.eval()
+            pred_list = None
+
+            if full_sort:
+                answer_list = None
+                for i, batch in rec_data_iter:
+                    batch = tuple(t.to(self.device) for t in batch)
+                    user_ids, input_ids, target_pos, target_neg, answers = batch
+                    recommend_output = self.model.transformer_encoder(input_ids)
+                    recommend_output = recommend_output[:, -1, :]
+                    rating_pred      = self.predict_full(recommend_output)
+                    rating_pred      = rating_pred.cpu().data.numpy().copy()
+                    batch_user_index = user_ids.cpu().numpy()
+                    rating_pred[self.args.train_matrix[batch_user_index].toarray() > 0] = 0
+                    ind             = np.argpartition(rating_pred, -20)[:, -20:]
+                    arr_ind         = rating_pred[np.arange(len(rating_pred))[:, None], ind]
+                    arr_ind_argsort = np.argsort(arr_ind)[np.arange(len(rating_pred)), ::-1]
+                    batch_pred_list = ind[np.arange(len(rating_pred))[:, None], arr_ind_argsort]
+                    if i == 0:
+                        pred_list   = batch_pred_list
+                        answer_list = answers.cpu().data.numpy()
+                    else:
+                        pred_list   = np.append(pred_list,   batch_pred_list, axis=0)
+                        answer_list = np.append(answer_list, answers.cpu().data.numpy(), axis=0)
+                return self.get_full_sort_score(epoch, answer_list, pred_list)
+
+            else:
+                for i, batch in rec_data_iter:
+                    batch = tuple(t.to(self.device) for t in batch)
+                    user_ids, input_ids, target_pos, target_neg, answers, sample_negs = batch
+                    recommend_output = self.model.finetune(input_ids)
+                    test_neg_items   = torch.cat((answers, sample_negs), -1)
+                    recommend_output = recommend_output[:, -1, :]
+                    test_logits      = self.predict_sample(recommend_output, test_neg_items)
+                    test_logits      = test_logits.cpu().detach().numpy().copy()
+                    if i == 0:
+                        pred_list = test_logits
+                    else:
+                        pred_list = np.append(pred_list, test_logits, axis=0)
+                return self.get_sample_scores(epoch, pred_list)
