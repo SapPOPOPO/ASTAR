@@ -1,239 +1,276 @@
-"""
-diagnose.py — GAN training diagnostics for ASTAR.
-
-Detects:
-    - Temporal collapse:  augmenter produces nearly-identical outputs
-                          regardless of input (mode collapse)
-    - Player dominance:   one player (rec or aug) overwhelms the other
-    - Gradient health:    vanishing / exploding gradients
-"""
-
-from typing import Dict, List, Optional
-
-import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
+import matplotlib.pyplot as plt
+from collections import defaultdict
 
 
 class GANDiagnostics:
-    """Collects and reports GAN training health metrics.
 
-    Usage::
+    def __init__(self, window_size=50):
+        self.window_size  = window_size
+        self.history      = defaultdict(list)
+        self.probe_ids    = None   # fixed sequences for temporal collapse check
+        self.probe_masks  = None   # their masks from previous epoch
 
-        diag = GANDiagnostics(window=50)
-        # Inside training loop:
-        diag.update(L_B=stats["L_B"], L_A=stats["L_A"],
-                    aug=aug_batch, lam=lam_batch)
-        if diag.should_report(epoch):
-            report = diag.report()
-            print(report)
-    """
+    # ── Setup ────────────────────────────────────────────────────────────────
 
-    def __init__(self, window: int = 50, report_every: int = 10) -> None:
-        self.window = window
-        self.report_every = report_every
-
-        self._L_B: List[float] = []
-        self._L_A: List[float] = []
-        self._aug_cosines: List[float] = []  # inter-sample cosine similarity
-        self._lam_values: List[float] = []
-        self._rec_grad_norms: List[float] = []
-        self._aug_grad_norms: List[float] = []
-
-    # ── update ────────────────────────────────────────────────────────────
-
-    def update(
-        self,
-        L_B: float,
-        L_A: float,
-        aug: Optional[torch.Tensor] = None,
-        lam: Optional[torch.Tensor] = None,
-    ) -> None:
-        """Record one batch of diagnostics.
-
-        Args:
-            L_B:   recommender loss
-            L_A:   augmenter loss
-            aug:   [B, L, D] augmented embeddings (optional)
-            lam:   [B, 1] lambda values (optional)
+    def register_probe(self, input_ids):
         """
-        self._L_B.append(L_B)
-        self._L_A.append(L_A)
+        Call ONCE before training with any fixed batch.
+        These sequences will be reused every epoch for temporal collapse.
+        """
+        self.probe_ids   = input_ids.clone().cpu()
+        self.probe_masks = None   # populated on first diagnostic call
 
-        if aug is not None and aug.size(0) > 1:
-            # Temporal collapse: if all aug vectors very similar → collapse
-            with torch.no_grad():
-                # Flatten to [B, L*D] and compute mean cosine of adjacent pairs
-                flat = aug.view(aug.size(0), -1).float()
-                flat_norm = F.normalize(flat, dim=-1)
-                cosine = (flat_norm[:-1] * flat_norm[1:]).sum(-1).mean().item()
-                self._aug_cosines.append(cosine)
+    # ── Individual checks ────────────────────────────────────────────────────
 
-        if lam is not None:
-            self._lam_values.extend(lam.detach().cpu().view(-1).tolist())
+    def check_temporal_collapse(self, augmenter, tau, threshold=0.95):
+        """Same sequences → same masks across epochs?"""
+        assert self.probe_ids is not None, "Call register_probe() before training."
 
-        # Trim to window
-        for lst in (self._L_B, self._L_A, self._aug_cosines, self._lam_values,
-                    self._rec_grad_norms, self._aug_grad_norms):
-            if len(lst) > self.window:
-                del lst[: len(lst) - self.window]
+        device = next(augmenter.parameters()).device
+        ids    = self.probe_ids.to(device)
 
-    def record_grad_norms(
-        self,
-        recommender: nn.Module,
-        augmenter: nn.Module,
-    ) -> None:
-        """Compute and store current gradient norms for both models."""
-        rec_norm = self._grad_norm(recommender)
-        aug_norm = self._grad_norm(augmenter)
-        self._rec_grad_norms.append(rec_norm)
-        self._aug_grad_norms.append(aug_norm)
+        with torch.no_grad():
+            masks, _, _, _, pad_mask = augmenter.sample_masks(
+                ids, tau=tau, hard=True, return_probs=True
+            )
+        masks = masks.cpu().float()
 
-    @staticmethod
-    def _grad_norm(model: nn.Module) -> float:
-        total = 0.0
-        for p in model.parameters():
-            if p.grad is not None:
-                total += p.grad.data.norm(2).item() ** 2
-        return total ** 0.5
+        if self.probe_masks is None:
+            self.probe_masks = masks
+            return {'diagnosis': 'Collecting first epoch'}
 
-    # ── reporting ─────────────────────────────────────────────────────────
+        # Cosine similarity per sequence between current and previous epoch
+        curr = F.normalize(masks * pad_mask.cpu().float(), dim=-1)
+        prev = F.normalize(self.probe_masks * pad_mask.cpu().float(), dim=-1)
+        sims = (curr * prev).sum(dim=-1)   # [B]
 
-    def should_report(self, epoch: int) -> bool:
-        return epoch % self.report_every == 0
+        # Only count sequences that had actual masking in both epochs
+        valid      = (masks.sum(dim=-1) > 0) & (self.probe_masks.sum(dim=-1) > 0)
+        sims       = sims[valid]
 
-    def report(self) -> Dict[str, float]:
-        """Compute and return diagnostic summary."""
-        result: Dict[str, float] = {}
+        self.probe_masks = masks
 
-        if self._L_B:
-            result["mean_L_B"] = float(np.mean(self._L_B))
-        if self._L_A:
-            result["mean_L_A"] = float(np.mean(self._L_A))
+        if len(sims) == 0:
+            return {'diagnosis': 'No valid masked sequences to compare'}
 
-        # Temporal collapse detection
-        if self._aug_cosines:
-            mean_cos = float(np.mean(self._aug_cosines))
-            result["mean_aug_cosine_similarity"] = mean_cos
-            result["temporal_collapse_risk"] = float(mean_cos > 0.95)
+        mean_sim      = sims.mean().item()
+        pct_collapsed = (sims > threshold).float().mean().item()
+        self.history['temporal_sim'].append(mean_sim)
 
-        # Player dominance: compare absolute magnitudes of L_B and L_A
-        if self._L_B and self._L_A:
-            abs_B = abs(float(np.mean(self._L_B)))
-            abs_A = abs(float(np.mean(self._L_A)))
-            ratio = abs_B / (abs_A + 1e-8)
-            result["loss_magnitude_ratio_B_over_A"] = ratio
-            # Dominance: if one player is >7x larger in magnitude
-            result["player_dominance_risk"] = float(abs(np.log(ratio + 1e-8)) > 2.0)
+        return {
+            'mean_sim':       mean_sim,
+            'pct_frozen':     pct_collapsed,
+            'n_tracked':      len(sims),
+            'diagnosis': (
+                f'COLLAPSE: {pct_collapsed:.0%} sequences frozen (mean={mean_sim:.3f})'
+                if mean_sim > threshold else
+                f'OK (mean={mean_sim:.3f})'
+            )
+        }
 
-        # λ statistics
-        if self._lam_values:
-            result["lambda_mean"] = float(np.mean(self._lam_values))
-            result["lambda_std"] = float(np.std(self._lam_values))
-            result["lambda_min"] = float(np.min(self._lam_values))
-            result["lambda_max"] = float(np.max(self._lam_values))
+    def check_player_dominance(self, loss_A, loss_B):
+        """Is one player winning completely?"""
+        self.history['loss_A'].append(loss_A)
+        self.history['loss_B'].append(loss_B)
 
-        # Gradient health
-        if self._rec_grad_norms:
-            result["rec_grad_norm"] = float(np.mean(self._rec_grad_norms))
-        if self._aug_grad_norms:
-            result["aug_grad_norm"] = float(np.mean(self._aug_grad_norms))
-            vanishing = float(np.mean(self._aug_grad_norms)) < 1e-4
-            exploding = float(np.mean(self._aug_grad_norms)) > 100.0
-            result["aug_grad_vanishing"] = float(vanishing)
-            result["aug_grad_exploding"] = float(exploding)
+        if len(self.history['loss_A']) < self.window_size:
+            return {'diagnosis': f'Collecting ({len(self.history["loss_A"])}/{self.window_size})'}
 
-        return result
+        A = np.array(self.history['loss_A'][-self.window_size:])
+        B = np.array(self.history['loss_B'][-self.window_size:])
+        x = np.arange(self.window_size)
 
-    def print_report(self, epoch: int) -> None:
-        """Pretty-print diagnostic report for an epoch."""
-        r = self.report()
-        lines = [f"=== GAN Diagnostics (epoch {epoch}) ==="]
-        for k, v in sorted(r.items()):
-            flag = " ⚠️" if v > 0.5 and "risk" in k else ""
-            flag = flag or (" ⚠️" if v > 0.5 and "vanishing" in k else "")
-            flag = flag or (" ⚠️" if v > 0.5 and "exploding" in k else "")
-            lines.append(f"  {k:40s}: {v:.4f}{flag}")
-        print("\n".join(lines))
+        trend_A = np.polyfit(x, A, 1)[0]
+        trend_B = np.polyfit(x, B, 1)[0]
 
+        if   trend_A >  0.01 and trend_B < -0.01:
+            diagnosis = 'RECOMMENDER DOMINANCE'
+        elif trend_B >  0.01 and trend_A < -0.01:
+            diagnosis = 'AUGMENTER DOMINANCE'
+        elif abs(trend_A) < 0.001 and abs(trend_B) < 0.001:
+            diagnosis = 'STAGNATION'
+        else:
+            diagnosis = 'OK'
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Standalone diagnostic probe
-# ─────────────────────────────────────────────────────────────────────────────
+        return {
+            'trend_A':   trend_A,
+            'trend_B':   trend_B,
+            'diagnosis': diagnosis
+        }
 
+    def check_gradient_health(self, model, name):
+        """Vanishing or exploding gradients?"""
+        norms     = {n: p.grad.norm().item()
+                     for n, p in model.named_parameters()
+                     if p.grad is not None}
 
-@torch.no_grad()
-def probe_continuous_input(
-    recommender: nn.Module,
-    input_ids: torch.Tensor,
-    device: torch.device,
-    L: int = 50,
-) -> Dict[str, float]:
-    """Critical diagnostic: does the recommender accept continuous augmented
-    embeddings comparably to discrete ids?
+        if not norms:
+            return {'diagnosis': f'{name}: no gradients found'}
 
-    Run BEFORE full training to validate the pre-encoder design assumption.
+        vanishing = [n for n, v in norms.items() if v < 1e-7]
+        exploding = [n for n, v in norms.items() if v > 100.0]
 
-    Constructs an identity T (K=0 probe) so that the augmented view is
-    identical to the original, then checks that the resulting loss matches
-    the original loss closely.
+        if len(vanishing) > len(norms) * 0.5:
+            diagnosis = f'VANISHING: {len(vanishing)}/{len(norms)} layers near zero'
+        elif exploding:
+            diagnosis = f'EXPLODING: {len(exploding)} layers too large'
+        else:
+            diagnosis = 'OK'
 
-    Args:
-        recommender: SASRec model
-        input_ids:   [B, L] batch of real item ids
-        device:      torch device
+        return {
+            'mean_norm': np.mean(list(norms.values())),
+            'max_norm':  max(norms.values()),
+            'diagnosis': diagnosis
+        }
 
-    Returns:
-        dict with 'orig_loss', 'aug_loss', 'loss_ratio'
-        (loss_ratio close to 1 → design assumption holds)
-    """
-    recommender.eval()
-    B = input_ids.size(0)
+    def check_oscillation(self, key):
+        """Is loss bouncing without converging?"""
+        if len(self.history[key]) < self.window_size:
+            return {'diagnosis': f'Collecting ({len(self.history[key])}/{self.window_size})'}
 
-    # Target: next item (shift by 1)
-    target_pos = input_ids[:, -1].clone()
-    target_neg = torch.randint(1, recommender.num_items + 1, (B,), device=device)
+        x        = np.array(self.history[key][-self.window_size:])
+        autocorr = np.corrcoef(x[:-1], x[1:])[0, 1]
+        changes  = np.mean(np.diff(np.sign(np.diff(x))) != 0)
 
-    # Original forward pass
-    repr_orig, orig_loss = recommender(
-        input_ids=input_ids,
-        target_pos=target_pos,
-        target_neg=target_neg,
-    )
+        oscillating = autocorr < -0.3 and changes > 0.4
 
-    # Identity T of shape [B, P, L] where P = L (K=0 for probe).
-    # Column j gets all weight on pool row j → identity mapping.
-    T_probe = torch.eye(L, device=device).unsqueeze(0).expand(B, -1, -1)  # [B, L, L]
-    lam_probe = torch.full((B, 1), 0.5, device=device)
+        return {
+            'autocorr':   autocorr,
+            'change_rate': changes,
+            'diagnosis':  f'OSCILLATION in {key}' if oscillating else 'OK'
+        }
 
-    repr_aug = recommender.get_mixed_representation(
-        input_ids=input_ids,
-        T=T_probe,
-        pool_ids=input_ids,
-        lam=lam_probe,
-    )
-    aug_loss = recommender.rec_loss(repr_aug, target_pos, target_neg)
+    def check_per_sequence_quality(self, masks1, masks2,
+                                    pad_mask, seq_lengths,
+                                    min_rate=0.05, max_rate=0.95,
+                                    max_asymmetry=0.4):
+        """Per-sequence degenerate pairs — what batch averages hide."""
+        rate1 = (masks1.float() * pad_mask).sum(1) / seq_lengths
+        rate2 = (masks2.float() * pad_mask).sum(1) / seq_lengths
+        diff  = (rate1 - rate2).abs()
 
-    orig_val = orig_loss.item()
-    aug_val = aug_loss.item()
-    ratio = aug_val / (orig_val + 1e-8)
+        overlap = ((masks1 == masks2).float() * pad_mask).sum(1) / seq_lengths
+        B       = masks1.size(0)
 
-    # Threshold for determining if continuous inputs are acceptable.
-    # A ratio > PROBE_LOSS_RATIO_THRESHOLD means augmented embeddings cause
-    # significantly higher loss than original ids, suggesting the pre-encoder
-    # continuous augmentation design assumption may not hold.
-    _PROBE_LOSS_RATIO_THRESHOLD = 3.0
+        pct = lambda t: (t.float().sum() / B).item()
 
-    print(f"[Probe] orig_loss={orig_val:.4f}  aug_loss={aug_val:.4f}  ratio={ratio:.3f}")
-    if ratio < _PROBE_LOSS_RATIO_THRESHOLD:
-        print("[Probe] ✓ Recommender accepts continuous inputs. Proceed with ASTAR.")
-    else:
-        print("[Probe] ✗ WARNING: Large loss increase with continuous inputs.")
-        print("         Consider pre-training augmenter longer or revising design.")
+        results = {
+            'pct_under_masked_1':  pct(rate1 < min_rate),
+            'pct_over_masked_1':   pct(rate1 > max_rate),
+            'pct_under_masked_2':  pct(rate2 < min_rate),
+            'pct_over_masked_2':   pct(rate2 > max_rate),
+            'pct_asymmetric':      pct(diff > max_asymmetry),
+            'pct_identical_views': pct(overlap > 0.95),
+            'mean_rate1':          rate1.mean().item(),
+            'mean_rate2':          rate2.mean().item(),
+            'mean_asymmetry':      diff.mean().item(),
+        }
 
-    return {
-        "orig_loss": orig_val,
-        "aug_loss": aug_val,
-        "loss_ratio": ratio,
-    }
+        issues = [
+            msg for cond, msg in [
+                (results['pct_under_masked_1']  > 0.1, f"{results['pct_under_masked_1']:.0%} under-masked (v1)"),
+                (results['pct_over_masked_1']   > 0.1, f"{results['pct_over_masked_1']:.0%} over-masked (v1)"),
+                (results['pct_under_masked_2']  > 0.1, f"{results['pct_under_masked_2']:.0%} under-masked (v2)"),
+                (results['pct_over_masked_2']   > 0.1, f"{results['pct_over_masked_2']:.0%} over-masked (v2)"),
+                (results['pct_asymmetric']      > 0.1, f"{results['pct_asymmetric']:.0%} asymmetric pairs"),
+                (results['pct_identical_views'] > 0.05, f"{results['pct_identical_views']:.0%} identical views"),
+            ] if cond
+        ]
+
+        results['diagnosis'] = ' | '.join(issues) if issues else 'OK'
+        return results
+
+    def check_contrastive_signal(self, recommender, aug_seq1, aug_seq2):
+        """Are the contrastive pairs actually informative?"""
+        with torch.no_grad():
+            z1 = F.normalize(recommender.transformer_encoder(aug_seq1)[:, -1, :], dim=-1)
+            z2 = F.normalize(recommender.transformer_encoder(aug_seq2)[:, -1, :], dim=-1)
+
+        sim   = torch.mm(z1, z2.T)
+        B     = z1.size(0)
+        pos   = sim.diag()
+        off   = ~torch.eye(B, dtype=torch.bool, device=sim.device)
+        neg   = sim[off].view(B, B - 1)
+
+        mean_pos      = pos.mean().item()
+        mean_neg      = neg.mean().item()
+        margin        = mean_pos - mean_neg
+        hard_positive = (pos < neg.max(1).values).float().mean().item()
+
+        self.history['margin'].append(margin)
+        self.history['mean_pos_sim'].append(mean_pos)
+
+        issues = [
+            msg for cond, msg in [
+                (mean_pos > 0.95,  'TRIVIAL: views too similar'),
+                (margin   < 0.05,  'WEAK MARGIN: pos/neg indistinguishable'),
+            ] if cond
+        ]
+        if hard_positive > 0.3:
+            issues.append(f'HARD PAIRS: {hard_positive:.0%} genuinely challenging ✓')
+
+        return {
+            'mean_pos':      mean_pos,
+            'mean_neg':      mean_neg,
+            'margin':        margin,
+            'hard_positive': hard_positive,
+            'diagnosis':     ' | '.join(issues) if issues else 'OK'
+        }
+
+    # ── Plot ─────────────────────────────────────────────────────────────────
+
+    def plot(self, save_path=None):
+        tracked = {k: v for k, v in self.history.items() if len(v) > 1}
+        if not tracked:
+            print("Nothing to plot yet.")
+            return
+
+        fig, axes = plt.subplots(len(tracked), 1,
+                                  figsize=(12, 3 * len(tracked)))
+        if len(tracked) == 1:
+            axes = [axes]
+
+        for ax, (key, vals) in zip(axes, tracked.items()):
+            ax.plot(vals, linewidth=1.5)
+            ax.set_title(key)
+            ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=150)
+        plt.show()
+
+    # ── Master call ──────────────────────────────────────────────────────────
+
+    def run(self, epoch,
+            masks1, masks2, pad_mask, seq_lengths,
+            loss_A, loss_B,
+            augmenter, recommender,
+            aug_seq1, aug_seq2):
+
+        results = {
+            'temporal_collapse':  self.check_temporal_collapse(augmenter, augmenter.tau),
+            'player_dominance':   self.check_player_dominance(loss_A, loss_B),
+            'grad_augmenter':     self.check_gradient_health(augmenter,   'augmenter'),
+            'grad_recommender':   self.check_gradient_health(recommender, 'recommender'),
+            'oscillation_A':      self.check_oscillation('loss_A'),
+            'oscillation_B':      self.check_oscillation('loss_B'),
+            'per_sequence':       self.check_per_sequence_quality(
+                                      masks1, masks2, pad_mask, seq_lengths),
+            'contrastive_signal': self.check_contrastive_signal(
+                                      recommender, aug_seq1, aug_seq2),
+        }
+
+        print(f"\n{'='*55}")
+        print(f"  DIAGNOSTIC — Epoch {epoch}")
+        print(f"{'='*55}")
+        for name, res in results.items():
+            d = res.get('diagnosis', 'N/A')
+            icon = '✓' if d in ('OK',) or d.startswith('Collect') else '✗'
+            print(f"  {icon}  {name:<25} {d}")
+        print(f"{'='*55}\n")
+
+        return results

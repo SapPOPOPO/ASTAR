@@ -1,311 +1,284 @@
-"""
-datasets.py — Data loading for sequential recommendation.
-
-Protocol: leave-one-out
-    - Last item for test
-    - Second-to-last for validation
-    - Rest for training
-
-Input format: inter_*.txt with space-separated user-item interactions,
-              sorted by time (each row: user item [timestamp]).
-"""
-
-import os
 import random
-from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
-
-import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset
+from data_augmentation import Crop, Mask, Reorder, Substitute, Insert, Random, CombinatorialEnumerate, RRandom
+from utils import neg_sample, nCr
+import copy
+import numpy as np
+from tqdm import tqdm
+
+class RecWithContrastiveLearningDataset(Dataset):
+    '''
+    A dataset that gives recommendation task and a pair of contrastive learning tasks
+    '''
+    def __init__(self, args, user_seq, test_neg_items=None, data_type='train', 
+                similarity_model_type='none'):
+        self.args = args
+        self.user_seq = user_seq
+        self.test_neg_items = test_neg_items
+        self.data_type = data_type
+        self.max_len = args.max_seq_length
+
+        if similarity_model_type=='offline':
+            self.similarity_model = args.offline_similarity_model
+        elif similarity_model_type=='online':
+            self.similarity_model = args.online_similarity_model
+        elif similarity_model_type=='hybrid':
+            self.similarity_model = [args.offline_similarity_model, args.online_similarity_model]
+        elif similarity_model_type=='none':
+            self.similarity_model = None
+
+        print("Similarity Model Type:", similarity_model_type)
+
+        self.augmentations = {'crop': Crop(tao=args.tao),
+                              'mask': Mask(gamma=args.gamma, mask_id=args.mask_id),
+                              'reorder': Reorder(beta=args.beta),
+                              'substitute': Substitute(self.similarity_model,
+                                                substitute_rate=args.substitute_rate),
+                              'insert': Insert(self.similarity_model, 
+                                               insert_rate=args.insert_rate,
+                                               max_insert_num_per_pos=args.max_insert_num_per_pos),
+                              'random': RRandom(tao=args.tao, gamma=args.gamma, 
+                                                beta=args.beta, item_similarity_model=self.similarity_model,
+                                                insert_rate=args.insert_rate, 
+                                                max_insert_num_per_pos=args.max_insert_num_per_pos,
+                                                substitute_rate=args.substitute_rate,
+                                                augment_threshold=self.args.augment_threshold,
+                                                augment_type_for_short=self.args.augment_type_for_short,
+                                                mask_id=args.mask_id),
+                              'combinatorial_enumerate': CombinatorialEnumerate(tao=args.tao, gamma=args.gamma, 
+                                                beta=args.beta, item_similarity_model=self.similarity_model,
+                                                insert_rate=args.insert_rate, 
+                                                max_insert_num_per_pos=args.max_insert_num_per_pos,
+                                                substitute_rate=args.substitute_rate, n_views=args.n_views)
+                            }
+
+        if self.args.base_augment_type not in self.augmentations:
+            raise ValueError(f"augmentation type: '{self.args.base_augment_type}' is invalided")
+        print(f"Creating Contrastive Learning Dataset using '{self.args.base_augment_type}' data augmentation")
+
+        # Define augmentation method
+        self.base_transform = self.augmentations[self.args.base_augment_type]
+
+        self.n_views = self.args.n_views
+
+    def _one_pair_data_augmentation(self, input_ids):
+        '''
+        provides two positive samples given one sequence
+        '''
+        augmented_seqs = []
+        aug_list = []
+        length = len(input_ids)
+        for i in range(2):
+            augmented_input_ids = self.base_transform(input_ids[-self.max_len:])
+            pad_len = self.max_len - len(augmented_input_ids)
+            augmented_input_ids = [0] * pad_len + augmented_input_ids
+            augmented_input_ids = augmented_input_ids[-self.max_len:]
+
+            assert len(augmented_input_ids) == self.max_len
+            aug_list.append(augmented_input_ids[-length:])
+            cur_tensors = (
+                torch.tensor(augmented_input_ids, dtype=torch.long)
+            )
+            augmented_seqs.append(cur_tensors) # We append the current tensors to the augmented_seqs list
+
+        similarity = np.array(aug_list[0] == aug_list[1]).mean()
+        return augmented_seqs, similarity # We return the augmented_seqs list
+
+    def _metrics_for_sequence(self, aug_list):
+        '''
+        Given a list containing two augmented sequences
+        (each of shape [seq_len] or a python list of ints),
+        returns three ratios that describe how the two views align
+        with respect to masked positions (mask_token == 0).
+
+        Returns
+        -------
+        same_masked_ratio   : float  # both views masked at the same position
+        same_unmasked_ratio : float  # both views un-masked at the same position
+        masked_ratio        : float  # average fraction of positions that are masked
+                            (averaged over the two views)
+
+        The ratios are computed **only on the overlapping suffix** of the two
+        sequences (right-aligned, as is conventional for rec-sys sequences).
+        '''
+    
+        seq1 = torch.as_tensor(aug_list[0], dtype=torch.long, device=self.args.device)
+        seq2 = torch.as_tensor(aug_list[1], dtype=torch.long, device=self.args.device)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# I/O helpers
-# ─────────────────────────────────────────────────────────────────────────────
+        len1, len2 = seq1.size(0), seq2.size(0)
+        min_len = min(len1, len2)
 
+        # Take the *most recent* min_len items from each view
+        s1 = seq1[-min_len:]      # shape [min_len]
+        s2 = seq2[-min_len:]      # shape [min_len]
 
-def load_interactions(data_path: str) -> Tuple[Dict[int, List[int]], int, int]:
-    """Read interaction file and return per-user item lists.
+        mask_token = 0
+        mask1 = (s1 == mask_token)      # [min_len] bool
+        mask2 = (s2 == mask_token)      # [min_len] bool
 
-    Supports two formats:
-        ``user item``              (one interaction per line)
-        ``user item timestamp``   (one interaction per line, sorted by time)
-        ``user item1 item2 ...``  (whole sequence per line, chronological order)
+        both_masked   = mask1 & mask2
+        both_unmasked = (~mask1) & (~mask2)
 
-    Returns:
-        user_seq:    dict mapping user_id → list[item_id] (chronological)
-        num_users:   total number of users (max user id)
-        num_items:   total number of items (max item id, 1-indexed)
-    """
-    user_seq: Dict[int, List[int]] = {}
-    max_item = 0
-    max_user = 0
+        same_masked_ratio   = both_masked.float().mean().item()      # P(both masked)
+        same_unmasked_ratio = both_unmasked.float().mean().item()    # P(both un-masked)
+        masked_ratio        = (mask1.float().mean() + mask2.float().mean()).item() / 2.0
 
-    with open(data_path, "r") as fh:
-        for line in fh:
-            parts = line.strip().split()
-            if len(parts) < 2:
-                continue
-            u = int(parts[0])
-            items = [int(x) for x in parts[1:]]
-            user_seq[u] = items
-            max_item = max(max_item, max(items))
-            max_user = max(max_user, u)
+        return [same_masked_ratio, same_unmasked_ratio, masked_ratio]
 
-    return user_seq, max_user, max_item
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Dataset classes
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-class RecDataset(Dataset):
-    """Base sequential recommendation dataset.
-
-    Applies max-length truncation and left-zero padding so all sequences
-    have exactly ``max_seq_len`` items.
-    """
-
-    def __init__(
-        self,
-        user_seq: Dict[int, List[int]],
-        max_seq_len: int,
-        split: str = "train",
-        num_items: int = 0,
-    ) -> None:
+    def _mask_from_prob(self, input_ids, prob, mask_token=0):
         """
-        Args:
-            user_seq:    per-user item sequences (full chronological list)
-            max_seq_len: maximum sequence length after truncation
-            split:       one of "train" | "valid" | "test"
-            num_items:   vocabulary size (used for negative sampling check)
+        mask from the probability
         """
-        assert split in ("train", "valid", "test")
-        self.max_seq_len = max_seq_len
-        self.split = split
-        self.num_items = num_items
+        augmented_seqs = []
+        original_seq = input_ids[-self.max_len:]
+        length = len(original_seq)
+        pad_len = self.max_len - length
+        original_seq = [0] * pad_len + original_seq
+        masked_count = 0.0
 
-        self.users: List[int] = []
-        self.input_ids: List[List[int]] = []
-        self.target_pos: List[int] = []
+        aug_list = []
+        try:
+            prob_np = prob.numpy()
+            # Pad prob_np to match self.max_len (pads with 0.0 at the beginning)
+            prob_padded = np.zeros(self.max_len)
+            prob_padded[pad_len:] = prob_np[:length]  # Align with actual items
+            for l in range(2):
+                seq = original_seq.copy()  # Copy to avoid in-place accumulation
+                mask_pos = (np.random.random(self.max_len) < prob_padded).astype(int)
+                for i in range(self.max_len):
+                    if mask_pos[i]:
+                        seq[i] = mask_token
+                        masked_count += 1.0 / length  # Use 1.0 for float division
 
-        for user, seq in user_seq.items():
-            if len(seq) < 3:
-                continue  # need at least train + valid + test items
+                seq = seq[-length:]
+                seq = self.base_transform(seq)
+                aug_list.append(seq)
 
-            if split == "train":
-                input_seq = seq[:-2]
-                target = seq[-2]  # second-to-last predicts last-valid
-                # For training, use all available prefixes (data augmentation)
-                for end in range(1, len(input_seq)):
-                    prefix = input_seq[:end]
-                    self.users.append(user)
-                    self.input_ids.append(prefix)
-                    self.target_pos.append(seq[end] if end < len(input_seq) else target)
+                pad_len = self.max_len - len(seq)
+                seq = [0] * pad_len + seq
+                seq = seq[-self.max_len:]
 
-            elif split == "valid":
-                input_seq = seq[:-2]
-                target = seq[-2]
-                self.users.append(user)
-                self.input_ids.append(input_seq)
-                self.target_pos.append(target)
+                cur_tensors = torch.tensor(seq, dtype=torch.long)
+                augmented_seqs.append(cur_tensors)
 
-            else:  # test
-                input_seq = seq[:-1]
-                target = seq[-1]
-                self.users.append(user)
-                self.input_ids.append(input_seq)
-                self.target_pos.append(target)
+            # Compute similarity on the unpadded parts (ignore padding)
+            metrics = self._metrics_for_sequence(aug_list)
 
-    def _pad(self, seq: List[int]) -> List[int]:
-        if len(seq) >= self.max_seq_len:
-            return seq[-self.max_seq_len :]
-        return [0] * (self.max_seq_len - len(seq)) + seq
+        except Exception as e:
+            print(f"Error in augmenter: {e}")
+            print("input_ids:", input_ids)
+            print("prob shape:", prob.shape if hasattr(prob, 'shape') else "N/A")
+            print('augmenter failed')
+            # Fallback: return unpadded or dummy
+            metrics = []
 
-    def __len__(self) -> int:
-        return len(self.users)
+        return augmented_seqs, masked_count / 2, metrics
+    
+    def _data_sample_rec_task(self, user_id, items, input_ids, target_pos, answer):        
+        copied_input_ids = copy.deepcopy(input_ids)
+        seq_set = set(items)
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        input_ids = torch.tensor(self._pad(self.input_ids[idx]), dtype=torch.long)
-        return {
-            "user": torch.tensor(self.users[idx], dtype=torch.long),
-            "input_ids": input_ids,
-            "target_pos": torch.tensor(self.target_pos[idx], dtype=torch.long),
-        }
+        target_neg = []
+        for _ in copied_input_ids:
+            target_neg.append(neg_sample(seq_set, self.args.item_size))
 
+        pad_len = self.max_len - len(copied_input_ids)
+        copied_input_ids = [0] * pad_len + copied_input_ids
+        target_pos = [0] * pad_len + target_pos
+        target_neg = [0] * pad_len + target_neg
 
-class TrainDataset(Dataset):
-    """Training dataset that also provides negative samples.
+        copied_input_ids = copied_input_ids[-self.max_len:]
+        target_pos = target_pos[-self.max_len:]
+        target_neg = target_neg[-self.max_len:]
 
-    For each training sample we additionally sample one negative item
-    (not in the user's history) for BPR / CE loss.
-    """
+        assert len(copied_input_ids) == self.max_len
+        assert len(target_pos) == self.max_len
+        assert len(target_neg) == self.max_len
 
-    def __init__(
-        self,
-        user_seq: Dict[int, List[int]],
-        max_seq_len: int,
-        num_items: int,
-    ) -> None:
-        self.max_seq_len = max_seq_len
-        self.num_items = num_items
+        if self.test_neg_items is not None:
+            test_samples = self.test_neg_items
 
-        # Build user history set for fast negative sampling
-        self.user_history: Dict[int, set] = {
-            u: set(s) for u, s in user_seq.items()
-        }
+            cur_rec_tensors = (
+                torch.tensor(user_id, dtype=torch.long), # user_id for testing
+                torch.tensor(copied_input_ids, dtype=torch.long),
+                torch.tensor(target_pos, dtype=torch.long),
+                torch.tensor(target_neg, dtype=torch.long),
+                torch.tensor(answer, dtype=torch.long),
+                torch.tensor(test_samples, dtype=torch.long), # The answer is used for testing and validation
+            )
+        else:
+            cur_rec_tensors = (
+                torch.tensor(user_id, dtype=torch.long),  # user_id for testing
+                torch.tensor(copied_input_ids, dtype=torch.long),
+                torch.tensor(target_pos, dtype=torch.long),
+                torch.tensor(target_neg, dtype=torch.long),
+                torch.tensor(answer, dtype=torch.long), # The answer is used for testing and validation
+            )
 
-        self.users: List[int] = []
-        self.input_ids: List[List[int]] = []
-        self.target_pos: List[int] = []
+        return cur_rec_tensors
 
-        for user, seq in user_seq.items():
-            if len(seq) < 3:
-                continue
-            # Leave out last two items (val, test)
-            train_seq = seq[:-2]
-            for end in range(1, len(train_seq)):
-                self.users.append(user)
-                self.input_ids.append(train_seq[:end])
-                # target is always the next item within train_seq; end ranges
-                # from 1 to len(train_seq)-1 so train_seq[end] is always valid
-                self.target_pos.append(train_seq[end])
+    def _add_noise_interactions(self, items):
+        copied_sequence = copy.deepcopy(items)
+        insert_nums = max(int(self.args.noise_ratio*len(copied_sequence)), 0)
+        if insert_nums == 0:
+            return copied_sequence
+        insert_idx = random.choices([i for i in range(len(copied_sequence))], k = insert_nums)
+        inserted_sequence = []
+        for index, item in enumerate(copied_sequence):
+            if index in insert_idx:
+                item_id = random.randint(1, self.args.item_size-2)
+                while item_id in copied_sequence:
+                    item_id = random.randint(1, self.args.item_size-2)
+                inserted_sequence += [item_id]
+            inserted_sequence += [item]
+        return inserted_sequence
 
-    def _pad(self, seq: List[int]) -> List[int]:
-        if len(seq) >= self.max_seq_len:
-            return seq[-self.max_seq_len :]
-        return [0] * (self.max_seq_len - len(seq)) + seq
+    def __getitem__(self, index):
+        user_id = index
+        items = self.user_seq[index]
 
-    def _sample_negative(self, user: int, pos: int) -> int:
-        history = self.user_history.get(user, set())
-        while True:
-            neg = random.randint(1, self.num_items)
-            if neg != pos and neg not in history:
-                return neg
+        assert self.data_type in {"train", "valid", "test"}
 
-    def __len__(self) -> int:
-        return len(self.users)
+        if self.data_type == "train":
+            input_ids = items[:-3]
+            target_pos = items[1:-2]
+            answer = [0] # no use
+        elif self.data_type == 'valid':
+            input_ids = items[:-2]
+            target_pos = items[1:-1]
+            answer = [items[-2]]
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        user = self.users[idx]
-        pos = self.target_pos[idx]
-        neg = self._sample_negative(user, pos)
-        input_ids = torch.tensor(self._pad(self.input_ids[idx]), dtype=torch.long)
-        return {
-            "user": torch.tensor(user, dtype=torch.long),
-            "input_ids": input_ids,
-            "target_pos": torch.tensor(pos, dtype=torch.long),
-            "target_neg": torch.tensor(neg, dtype=torch.long),
-        }
+        else:
+            items_with_noise = self._add_noise_interactions(items)
+            input_ids = items_with_noise[:-1]
+            target_pos = items_with_noise[1:]
+            answer = [items_with_noise[-1]]
+            
+        if self.data_type == "train":
+            cur_rec_tensors = self._data_sample_rec_task(user_id, items, input_ids, target_pos, answer)
+            cf_tensors_list = []
 
+            total_augmentaion_pairs = nCr(self.n_views, 2)
+            for i in range(total_augmentaion_pairs):
+                aug_seq, similarity = self._one_pair_data_augmentation(input_ids)
+                cf_tensors_list.append([aug_seq, 0, similarity])
 
-class EvalDataset(Dataset):
-    """Evaluation dataset (valid / test).
+            return (cur_rec_tensors, cf_tensors_list)
 
-    Full-ranking: the positive item is ranked against ALL other items
-    (excluding items seen during training).
-    """
+        elif self.data_type == 'valid':
+            cur_rec_tensors = self._data_sample_rec_task(user_id, items, input_ids, \
+                                target_pos, answer)
+            return cur_rec_tensors
+        
+        else:
+            cur_rec_tensors = self._data_sample_rec_task(user_id, items_with_noise, input_ids, \
+                                target_pos, answer)
+            return cur_rec_tensors
 
-    def __init__(
-        self,
-        user_seq: Dict[int, List[int]],
-        max_seq_len: int,
-        num_items: int,
-        split: str = "valid",
-    ) -> None:
-        assert split in ("valid", "test")
-        self.max_seq_len = max_seq_len
-        self.num_items = num_items
-
-        self.users: List[int] = []
-        self.input_ids: List[List[int]] = []
-        self.target_pos: List[int] = []
-        self.train_history: List[List[int]] = []
-
-        for user, seq in user_seq.items():
-            if len(seq) < 3:
-                continue
-            if split == "valid":
-                input_seq = seq[:-2]
-                target = seq[-2]
-                train_items = seq[:-2]
-            else:
-                input_seq = seq[:-1]
-                target = seq[-1]
-                train_items = seq[:-1]
-
-            self.users.append(user)
-            self.input_ids.append(input_seq)
-            self.target_pos.append(target)
-            self.train_history.append(train_items)
-
-    def _pad(self, seq: List[int]) -> List[int]:
-        if len(seq) >= self.max_seq_len:
-            return seq[-self.max_seq_len :]
-        return [0] * (self.max_seq_len - len(seq)) + seq
-
-    def __len__(self) -> int:
-        return len(self.users)
-
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        input_ids = torch.tensor(self._pad(self.input_ids[idx]), dtype=torch.long)
-        return {
-            "user": torch.tensor(self.users[idx], dtype=torch.long),
-            "input_ids": input_ids,
-            "target_pos": torch.tensor(self.target_pos[idx], dtype=torch.long),
-            "train_history": torch.tensor(self._pad(self.train_history[idx]), dtype=torch.long),  # ← pad this
-        }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Factory
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def build_dataloaders(
-    data_path: str,
-    max_seq_len: int = 50,
-    batch_size: int = 256,
-    num_workers: int = 4,
-    seed: int = 42,
-) -> Tuple[DataLoader, DataLoader, DataLoader, int, int]:
-    """Build train / valid / test DataLoaders from a raw interaction file.
-
-    Returns:
-        train_loader, valid_loader, test_loader, num_users, num_items
-    """
-    random.seed(seed)
-    np.random.seed(seed)
-
-    user_seq, num_users, num_items = load_interactions(data_path)
-
-    train_ds = TrainDataset(user_seq, max_seq_len, num_items)
-    valid_ds = EvalDataset(user_seq, max_seq_len, num_items, split="valid")
-    test_ds = EvalDataset(user_seq, max_seq_len, num_items, split="test")
-
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
-        drop_last=True,  # needed for inter-sequence sampling
-    )
-    valid_loader = DataLoader(
-        valid_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-    )
-    test_loader = DataLoader(
-        test_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-    )
-
-    return train_loader, valid_loader, test_loader, num_users, num_items
+    def __len__(self):
+        '''
+        consider n_view of a single sequence as one sample
+        '''
+        return len(self.user_seq)

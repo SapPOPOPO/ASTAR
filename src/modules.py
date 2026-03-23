@@ -1,198 +1,302 @@
-"""
-modules.py — Shared building blocks for ASTAR.
+# -*- coding:utf-8 -*-
 
-Contains: LayerNorm, SelfAttentionBlock, FeedForwardBlock,
-          Encoder (SASRec-style transformer), NCELoss (InfoNCE).
-"""
+import numpy as np
 
+import copy
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-class LayerNorm(nn.Module):
-    """Layer normalisation with learnable gain and bias."""
+class NCELoss(nn.Module):
+    """
+    Eq. (12): L_{NCE}
+    """
+    def __init__(self, temperature, device):
+        super(NCELoss, self).__init__()
+        self.device = device
+        self.criterion = nn.CrossEntropyLoss().to(self.device)
+        self.temperature = temperature
+        self.cossim = nn.CosineSimilarity(dim=-1).to(self.device)
+        
+    # #modified based on impl: https://github.com/ae-foster/pytorch-simclr/blob/dc9ac57a35aec5c7d7d5fe6dc070a975f493c1a5/critic.py#L5
+    def forward(self, batch_sample_one, batch_sample_two):
+        sim11 = torch.matmul(batch_sample_one, batch_sample_one.T) / self.temperature
+        sim22 = torch.matmul(batch_sample_two, batch_sample_two.T) / self.temperature
+        sim12 = torch.matmul(batch_sample_one, batch_sample_two.T) / self.temperature
+        d = sim12.shape[-1]
+        sim11[..., range(d), range(d)] = float('-inf')
+        sim22[..., range(d), range(d)] = float('-inf')
+        raw_scores1 = torch.cat([sim12, sim11], dim=-1)
+        raw_scores2 = torch.cat([sim22, sim12.transpose(-1, -2)], dim=-1)
+        logits = torch.cat([raw_scores1, raw_scores2], dim=-2)
+        labels = torch.arange(2 * d, dtype=torch.long, device=logits.device)
+        nce_loss = self.criterion(logits, labels)
+        return nce_loss
 
-    def __init__(self, hidden_size: int, eps: float = 1e-12) -> None:
+class NTXent(nn.Module):
+    """
+    Contrastive loss with distributed data parallel support
+    code: https://github.com/AndrewAtanov/simclr-pytorch/blob/master/models/losses.py
+    """
+    LARGE_NUMBER = 1e9
+
+    def __init__(self, tau=1., gpu=None, multiplier=2, distributed=False):
         super().__init__()
+        self.tau = tau
+        self.multiplier = multiplier
+        self.distributed = distributed
+        self.norm = 1.
+
+    def forward(self, batch_sample_one, batch_sample_two):
+        z = torch.cat([batch_sample_one, batch_sample_two], dim=0)
+        n = z.shape[0]
+        assert n % self.multiplier == 0
+
+        z = F.normalize(z, p=2, dim=1) / np.sqrt(self.tau)
+        logits = z @ z.t()
+        logits[np.arange(n), np.arange(n)] = -self.LARGE_NUMBER
+
+        logprob = F.log_softmax(logits, dim=1)
+
+        # choose all positive objects for an example, for i it would be (i + k * n/m), where k=0...(m-1)
+        m = self.multiplier
+        labels = (np.repeat(np.arange(n), m) + np.tile(np.arange(m) * n//m, n)) % n
+        # remove labels pointet to itself, i.e. (i, i)
+        labels = labels.reshape(n, m)[:, 1:].reshape(-1)
+
+        # TODO: maybe different terms for each process should only be computed here...
+        loss = -logprob[np.repeat(np.arange(n), m-1), labels].sum() / n / (m-1) / self.norm
+        return loss
+
+def gelu(x):
+    """Implementation of the gelu activation function.
+        For information: OpenAI GPT's gelu is slightly different
+        (and gives slightly different results):
+        0.5 * x * (1 + torch.tanh(math.sqrt(2 / math.pi) *
+        (x + 0.044715 * torch.pow(x, 3))))
+        Also see https://arxiv.org/abs/1606.08415
+    """
+    return x * 0.5 * (1.0 + torch.erf(x / math.sqrt(2.0)))
+
+def swish(x):
+    return x * torch.sigmoid(x)
+
+
+ACT2FN = {"gelu": gelu, "relu": F.relu, "swish": swish}
+
+
+class LayerNorm(nn.Module):
+    def __init__(self, hidden_size, eps=1e-12):
+        """Construct a layernorm module in the TF style (epsilon inside the square root).
+        """
+        super(LayerNorm, self).__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.bias = nn.Parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         u = x.mean(-1, keepdim=True)
         s = (x - u).pow(2).mean(-1, keepdim=True)
         x = (x - u) / torch.sqrt(s + self.variance_epsilon)
         return self.weight * x + self.bias
 
 
-class SelfAttentionBlock(nn.Module):
-    """Multi-head self-attention block (SASRec style, causal)."""
+class Embeddings(nn.Module):
+    """Construct the embeddings from item, position.
+    """
+    def __init__(self, args):
+        super(Embeddings, self).__init__()
 
-    def __init__(self, hidden_size: int, num_heads: int, dropout: float = 0.1) -> None:
-        super().__init__()
-        assert hidden_size % num_heads == 0
-        self.num_heads = num_heads
-        self.head_dim = hidden_size // num_heads
-        self.scale = math.sqrt(self.head_dim)
+        self.item_embeddings = nn.Embedding(args.item_size, args.hidden_size, padding_idx=0) # 不要乱用padding_idx
+        self.position_embeddings = nn.Embedding(args.max_seq_length, args.hidden_size)
 
-        self.query = nn.Linear(hidden_size, hidden_size)
-        self.key = nn.Linear(hidden_size, hidden_size)
-        self.value = nn.Linear(hidden_size, hidden_size)
-        self.out_proj = nn.Linear(hidden_size, hidden_size)
+        self.LayerNorm = LayerNorm(args.hidden_size, eps=1e-12)
+        self.dropout = nn.Dropout(args.hidden_dropout_prob)
 
-        self.attn_dropout = nn.Dropout(dropout)
-        self.layer_norm = LayerNorm(hidden_size)
-        self.out_dropout = nn.Dropout(dropout)
+        self.args = args
 
-    def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
-        B, L, D = x.shape
-        x = x.view(B, L, self.num_heads, self.head_dim)
-        return x.transpose(1, 2)  # [B, H, L, d]
+    def forward(self, input_ids):
+        seq_length = input_ids.size(1)
+        position_ids = torch.arange(seq_length, dtype=torch.long, device=input_ids.device)
+        position_ids = position_ids.unsqueeze(0).expand_as(input_ids)
+        items_embeddings = self.item_embeddings(input_ids)
+        position_embeddings = self.position_embeddings(position_ids)
+        embeddings = items_embeddings + position_embeddings
+        # 修改属性
+        embeddings = self.LayerNorm(embeddings)
+        embeddings = self.dropout(embeddings)
+        return embeddings
 
-    def _merge_heads(self, x: torch.Tensor) -> torch.Tensor:
-        B, H, L, d = x.shape
-        x = x.transpose(1, 2).contiguous()
-        return x.view(B, L, H * d)
+class SelfAttention(nn.Module):
+    def __init__(self, args):
+        super(SelfAttention, self).__init__()
+        if args.hidden_size % args.num_attention_heads != 0:
+            raise ValueError(
+                "The hidden size (%d) is not a multiple of the number of attention "
+                "heads (%d)" % (args.hidden_size, args.num_attention_heads))
+        self.num_attention_heads = args.num_attention_heads
+        self.attention_head_size = int(args.hidden_size / args.num_attention_heads)
+        self.all_head_size = self.num_attention_heads * self.attention_head_size
 
-    def forward(
-        self,
-        hidden: torch.Tensor,
-        attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        residual = hidden
-        hidden = self.layer_norm(hidden)
+        self.query = nn.Linear(args.hidden_size, self.all_head_size)
+        self.key = nn.Linear(args.hidden_size, self.all_head_size)
+        self.value = nn.Linear(args.hidden_size, self.all_head_size)
 
-        Q = self._split_heads(self.query(hidden))
-        K = self._split_heads(self.key(hidden))
-        V = self._split_heads(self.value(hidden))
+        self.attn_dropout = nn.Dropout(args.attention_probs_dropout_prob)
 
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
-        scores = scores + attention_mask
-        weights = self.attn_dropout(F.softmax(scores, dim=-1))
+        # 做完self-attention 做一个前馈全连接 LayerNorm 输出
+        self.dense = nn.Linear(args.hidden_size, args.hidden_size)
+        self.LayerNorm = LayerNorm(args.hidden_size, eps=1e-12)
+        self.out_dropout = nn.Dropout(args.hidden_dropout_prob)
 
-        context = self._merge_heads(torch.matmul(weights, V))
-        out = self.out_dropout(self.out_proj(context))
-        return residual + out
+    def transpose_for_scores(self, x):
+        new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
+        x = x.view(*new_x_shape)
+        return x.permute(0, 2, 1, 3)
+
+    def forward(self, input_tensor, attention_mask):
+        mixed_query_layer = self.query(input_tensor)
+        mixed_key_layer = self.key(input_tensor)
+        mixed_value_layer = self.value(input_tensor)
+
+        query_layer = self.transpose_for_scores(mixed_query_layer)
+        key_layer = self.transpose_for_scores(mixed_key_layer)
+        value_layer = self.transpose_for_scores(mixed_value_layer)
+
+        # Take the dot product between "query" and "key" to get the raw attention scores.
+        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
+
+        attention_scores = attention_scores / math.sqrt(self.attention_head_size)
+        # Apply the attention mask is (precomputed for all layers in BertModel forward() function)
+        # [batch_size heads seq_len seq_len] scores
+        # [batch_size 1 1 seq_len]
+        attention_scores = attention_scores + attention_mask
+
+        # Normalize the attention scores to probabilities.
+        attention_probs = nn.Softmax(dim=-1)(attention_scores)
+        # This is actually dropping out entire tokens to attend to, which might
+        # seem a bit unusual, but is taken from the original Transformer paper.
+        # Fixme
+        attention_probs = self.attn_dropout(attention_probs)
+        context_layer = torch.matmul(attention_probs, value_layer)
+        context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
+        new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
+        context_layer = context_layer.view(*new_context_layer_shape)
+        hidden_states = self.dense(context_layer)
+        hidden_states = self.out_dropout(hidden_states)
+        hidden_states = self.LayerNorm(hidden_states + input_tensor)
+
+        return hidden_states
 
 
-class FeedForwardBlock(nn.Module):
-    """Position-wise feed-forward block with residual + layer norm."""
+class Intermediate(nn.Module):
+    def __init__(self, args):
+        super(Intermediate, self).__init__()
+        self.dense_1 = nn.Linear(args.hidden_size, args.hidden_size * 4)
+        if isinstance(args.hidden_act, str):
+            self.intermediate_act_fn = ACT2FN[args.hidden_act]
+        else:
+            self.intermediate_act_fn = args.hidden_act
 
-    def __init__(self, hidden_size: int, inner_size: int, dropout: float = 0.1) -> None:
-        super().__init__()
-        self.fc1 = nn.Linear(hidden_size, inner_size)
-        self.fc2 = nn.Linear(inner_size, hidden_size)
-        self.layer_norm = LayerNorm(hidden_size)
-        self.dropout = nn.Dropout(dropout)
-        self.act = nn.GELU()
-
-    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        residual = hidden
-        hidden = self.layer_norm(hidden)
-        hidden = self.dropout(self.act(self.fc1(hidden)))
-        hidden = self.dropout(self.fc2(hidden))
-        return residual + hidden
+        self.dense_2 = nn.Linear(args.hidden_size * 4, args.hidden_size)
+        self.LayerNorm = LayerNorm(args.hidden_size, eps=1e-12)
+        self.dropout = nn.Dropout(args.hidden_dropout_prob)
 
 
-class TransformerBlock(nn.Module):
-    """One SASRec transformer block (self-attn + FFN)."""
+    def forward(self, input_tensor):
 
-    def __init__(
-        self,
-        hidden_size: int,
-        num_heads: int,
-        inner_size: int,
-        dropout: float = 0.1,
-    ) -> None:
-        super().__init__()
-        self.attention = SelfAttentionBlock(hidden_size, num_heads, dropout)
-        self.ffn = FeedForwardBlock(hidden_size, inner_size, dropout)
+        hidden_states = self.dense_1(input_tensor)
+        hidden_states = self.intermediate_act_fn(hidden_states)
 
-    def forward(
-        self, hidden: torch.Tensor, attention_mask: torch.Tensor
-    ) -> torch.Tensor:
-        hidden = self.attention(hidden, attention_mask)
-        hidden = self.ffn(hidden)
-        return hidden
+        hidden_states = self.dense_2(hidden_states)
+        hidden_states = self.dropout(hidden_states)
+        hidden_states = self.LayerNorm(hidden_states + input_tensor)
+
+        return hidden_states
+
+
+class Layer(nn.Module):
+    def __init__(self, args):
+        super(Layer, self).__init__()
+        self.attention = SelfAttention(args)
+        self.intermediate = Intermediate(args)
+
+    def forward(self, hidden_states, attention_mask):
+        attention_output = self.attention(hidden_states, attention_mask)
+        intermediate_output = self.intermediate(attention_output)
+        return intermediate_output
 
 
 class Encoder(nn.Module):
-    """Stack of TransformerBlocks with causal masking support."""
+    def __init__(self, args):
+        super(Encoder, self).__init__()
+        layer = Layer(args)
+        self.layer = nn.ModuleList([copy.deepcopy(layer)
+                                    for _ in range(args.num_hidden_layers)])
 
-    def __init__(
-        self,
-        hidden_size: int,
-        num_heads: int,
-        num_layers: int,
-        inner_size: int,
-        dropout: float = 0.1,
-    ) -> None:
-        super().__init__()
-        self.layers = nn.ModuleList(
-            [
-                TransformerBlock(hidden_size, num_heads, inner_size, dropout)
-                for _ in range(num_layers)
-            ]
-        )
+    def forward(self, hidden_states, attention_mask, output_all_encoded_layers=True):
+        all_encoder_layers = []
+        for layer_module in self.layer:
+            hidden_states = layer_module(hidden_states, attention_mask)
+            if output_all_encoded_layers:
+                all_encoder_layers.append(hidden_states)
+        if not output_all_encoded_layers:
+            all_encoder_layers.append(hidden_states)
+        return all_encoder_layers
 
-    @staticmethod
-    def _build_causal_mask(seq_len: int, device: torch.device) -> torch.Tensor:
-        """Upper triangular mask (additive, -inf above diagonal)."""
-        mask = torch.triu(
-            torch.full((seq_len, seq_len), float("-inf"), device=device), diagonal=1
-        )
-        return mask.unsqueeze(0).unsqueeze(0)  # [1, 1, L, L]
-
-    def forward(
-        self, hidden: torch.Tensor, pad_mask: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Args:
-            hidden:   [B, L, D] input embeddings
-            pad_mask: [B, L]    1 for real tokens, 0 for padding
-        Returns:
-            [B, L, D] contextual representations
-        """
-        B, L, D = hidden.shape
-        causal = self._build_causal_mask(L, hidden.device)
-        # Convert padding mask to additive bias: [B, 1, 1, L]
-        pad_bias = (1.0 - pad_mask.float()).unsqueeze(1).unsqueeze(2) * float("-inf")
-        attn_mask = causal + pad_bias  # broadcast to [B, 1, L, L]
-        # Replace nan (0 * -inf) with 0 to avoid gradient issues
-        attn_mask = torch.nan_to_num(attn_mask, nan=0.0, posinf=0.0, neginf=float("-inf"))
-
-        for layer in self.layers:
-            hidden = layer(hidden, attn_mask)
-        return hidden
-
-
-class NCELoss(nn.Module):
-    """InfoNCE contrastive loss (normalised temperature cross-entropy).
-
-    Pulls together positive pairs (z1[i], z2[i]) while pushing apart
-    negatives within the batch.
+class MultiPositiveInfoNCE(nn.Module):
     """
+    Multi-positive InfoNCE that uses shared target items to identify
+    additional in-batch positives, eliminating false negatives.
 
-    def __init__(self, temperature: float = 0.07) -> None:
+    For anchor i, positives = {augmentation pair} ∪ {j : target[j] == target[i], j ≠ i}
+    Loss is averaged over positives per anchor (SupCon-style normalization).
+
+    Uses dot-product similarity (same as NCELoss) for scale compatibility.
+    """
+    LARGE_NUMBER = 1e9
+
+    def __init__(self, temperature, device):
         super().__init__()
         self.temperature = temperature
+        self.device = device
 
-    def forward(self, z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
+    def forward(self, batch_sample_one, batch_sample_two, target_pos):
         """
         Args:
-            z1: [B, D] view 1 representations (L2-normalised)
-            z2: [B, D] view 2 representations (L2-normalised)
-        Returns:
-            scalar loss
+            batch_sample_one: [B, D] — view 1 representations
+            batch_sample_two: [B, D] — view 2 representations
+            target_pos: [B] — ground-truth next item IDs
         """
-        z1 = F.normalize(z1, dim=-1)
-        z2 = F.normalize(z2, dim=-1)
+        target_pos = target_pos.view(-1).to(self.device)
+        B = batch_sample_one.shape[0]
+        z = torch.cat([batch_sample_one, batch_sample_two], dim=0)  # [2B, D]
+        n = z.shape[0]
 
-        B = z1.size(0)
-        # Similarity matrix [B, B]
-        sim = torch.matmul(z1, z2.T) / self.temperature
-        labels = torch.arange(B, device=z1.device)
-        loss = (F.cross_entropy(sim, labels) + F.cross_entropy(sim.T, labels)) / 2
+        # Dot-product similarity (matches NCELoss)
+        sim = torch.matmul(z, z.T) / self.temperature  # [2B, 2B]
+        sim[range(n), range(n)] = -self.LARGE_NUMBER     # mask self
+
+        # Positive mask: same-item + augmentation pair
+        targets = target_pos.repeat(2)  # [2B]
+        pos_mask = (targets.unsqueeze(0) == targets.unsqueeze(1))  # [2B, 2B]
+        pos_mask.fill_diagonal_(False)
+        valid = (targets > 0)
+        pos_mask = pos_mask & valid.unsqueeze(0) & valid.unsqueeze(1)
+
+        # Augmentation pair: always positive
+        idx = torch.arange(B, device=z.device)
+        pos_mask[idx, idx + B] = True
+        pos_mask[idx + B, idx] = True
+
+        # SupCon-style: average log-prob over positives per anchor
+        num_pos = pos_mask.float().sum(dim=1).clamp(min=1.0)
+        log_prob = torch.log_softmax(sim, dim=1)
+        per_anchor = -(log_prob * pos_mask.float()).sum(dim=1) / num_pos
+
+        # Average over valid anchors only
+        valid_f = valid.float()
+        loss = (per_anchor * valid_f).sum() / valid_f.sum().clamp(min=1.0)
         return loss

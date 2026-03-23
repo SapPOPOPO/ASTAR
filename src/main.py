@@ -1,348 +1,201 @@
-"""
-main.py — Entry point for ASTAR training and evaluation.
+# -*- coding: utf-8 -*-
 
-Usage:
-    python main.py --data_path data/Beauty.txt --dataset Beauty
-    python main.py --data_path data/Sports.txt --dataset Sports --ablation intra
-    python main.py --data_path data/Yelp.txt   --dataset Yelp   --probe_only
-"""
-
-import argparse
 import os
-import sys
-import json
-from typing import Optional
-
+import numpy as np
+import random
 import torch
-
-# Add src to path when running from repo root
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from augmenter import ASTARAugmenter
-from datasets import build_dataloaders
-from diagnose import GANDiagnostics, probe_continuous_input
-from recommender import SASRec
-from trainers import AdvAugmentTrainer
-from utils import set_seed
-from visualize import (
-    compute_intra_inter_ratio,
-    visualize_T,
-    visualize_intra_inter,
-    visualize_lambda,
-)
+import argparse
+from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
+from datasets import RecWithContrastiveLearningDataset
+from trainers import CoSeRecTrainer, AdvAugmentTrainer
+from recommender import SASRecModel
+from ASTAR import ASTARAugmenter
+from utils import EarlyStopping, get_user_seqs, get_item2attribute_json, check_path, set_seed
+from diagnose import GANDiagnostics
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Argument parser
-# ─────────────────────────────────────────────────────────────────────────────
+def show_args_info(args):
+    print(f"--------------------Configure Info:------------")
+    for arg in vars(args):
+        value = getattr(args, arg)
+        value_str = str(value) if value is not None else "None"
+        print(f"{arg:<30} : {value_str:>35}")
+
+def initialize_parser():
+    parser = argparse.ArgumentParser()
+
+    # system args
+    parser.add_argument('--data_dir', default='/home/chenyixu/CoSeRec/data/', type=str)
+    parser.add_argument('--output_dir', default='output/', type=str)
+    parser.add_argument('--tensorboard_dir', default=None, type=str)
+    parser.add_argument('--data_name', default='Beauty', type=str)
+    parser.add_argument('--do_eval', action='store_true')
+    parser.add_argument('--model_idx', default=0, type=int)
+    parser.add_argument("--gpu_id", type=str, default="0")
+
+    # data augmentation args
+    parser.add_argument('--noise_ratio', default=0.0, type=float)
+    parser.add_argument('--training_data_ratio', default=1.0, type=float)
+    parser.add_argument('--augment_threshold', default=4, type=int)
+    parser.add_argument('--similarity_model_name', default='ItemCF_IUF', type=str)
+    parser.add_argument("--augmentation_warm_up_epoches", type=float, default=400)
+    parser.add_argument('--base_augment_type', default='reorder', type=str)
+    parser.add_argument('--augment_type_for_short', default='SIM', type=str)
+    parser.add_argument("--tao", type=float, default=0.2)
+    parser.add_argument("--gamma", type=float, default=0.7)
+    parser.add_argument("--beta", type=float, default=0.2)
+    parser.add_argument("--substitute_rate", type=float, default=0.1)
+    parser.add_argument("--insert_rate", type=float, default=0.4)
+    parser.add_argument("--max_insert_num_per_pos", type=int, default=1)
+
+    # contrastive learning args
+    parser.add_argument('--temperature', default=1.0, type=float)
+    parser.add_argument('--n_views', default=2, type=int, metavar='N')
+
+    # model args
+    parser.add_argument("--model_name", default='CoSeRec', type=str)
+    parser.add_argument("--hidden_size", type=int, default=64)
+    parser.add_argument("--num_hidden_layers", type=int, default=2)
+    parser.add_argument('--num_attention_heads', default=2, type=int)
+    parser.add_argument('--hidden_act', default="gelu", type=str)
+    parser.add_argument("--attention_probs_dropout_prob", type=float, default=0.5)
+    parser.add_argument("--hidden_dropout_prob", type=float, default=0.5)
+    parser.add_argument("--initializer_range", type=float, default=0.02)
+    parser.add_argument('--max_seq_length', default=50, type=int)
+
+    # train args
+    parser.add_argument("--lr", type=float, default=0.001)
+    parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--epochs", type=int, default=600)
+    parser.add_argument("--no_cuda", action="store_true")
+    parser.add_argument("--log_freq", type=int, default=1)
+    parser.add_argument("--seed", default=1, type=int)
+    parser.add_argument("--cf_weight", type=float, default=0.2)
+    parser.add_argument("--check_weight", type=float, default=0.2)
+    parser.add_argument("--rec_weight", type=float, default=1.0)
+
+    # learning related
+    parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument("--adam_beta1", type=float, default=0.9)
+    parser.add_argument("--adam_beta2", type=float, default=0.999)
+
+    # augmenter args
+    parser.add_argument("--mask_tau", type=float, default=10.0)
+    parser.add_argument("--penalty_weight", type=float, default=0.1)
+    parser.add_argument("--reg_weight", type=float, default=0.2)
+    parser.add_argument("--asym_weight", type=float, default=0.2)
+    parser.add_argument("--target_rate", type=float, default=0.5)
+    parser.add_argument("--ratio", type=float, default=0.7)
+    parser.add_argument('--run_id', default=None, type=str)
+
+    args = parser.parse_args()
+    return args
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="ASTAR: Adversarial Sequential Transformation Augmentation for Recommendation"
-    )
-
-    # Data
-    p.add_argument("--data_path", type=str, required=True,
-                   help="Path to interaction file (space-separated user item [ts])")
-    p.add_argument("--dataset", type=str, default="dataset",
-                   help="Dataset name (used for logging and save paths)")
-    p.add_argument("--max_seq_len", type=int, default=50)
-
-    # Model architecture
-    p.add_argument("--hidden_size", type=int, default=256)
-    p.add_argument("--num_heads", type=int, default=2)
-    p.add_argument("--num_layers", type=int, default=2)
-    p.add_argument("--inner_size", type=int, default=512)
-    p.add_argument("--dropout", type=float, default=0.1)
-
-    # Augmenter
-    p.add_argument("--K", type=int, default=4,
-                   help="Number of inter-sequence samples per example")
-    p.add_argument("--tau_init", type=float, default=10.0)
-    p.add_argument("--tau_floor", type=float, default=1.0)
-    p.add_argument("--tau_decay", type=float, default=0.99)
-
-    # Training
-    p.add_argument("--batch_size", type=int, default=256)
-    p.add_argument("--num_epochs", type=int, default=200)
-    p.add_argument("--patience", type=int, default=20)
-    p.add_argument("--warmup_epochs", type=int, default=20)
-    p.add_argument("--rec_lr", type=float, default=1e-3)
-    p.add_argument("--aug_lr", type=float, default=1e-3)
-    p.add_argument("--weight_decay", type=float, default=1e-5)
-
-    # Loss weights
-    p.add_argument("--gamma", type=float, default=0.1,
-                   help="Weight of L_rec_aug in recommender loss")
-    p.add_argument("--lambda_cl", type=float, default=0.1,
-                   help="Weight of contrastive loss in recommender loss")
-    p.add_argument("--alpha", type=float, default=1.0,
-                   help="Weight of -L_contrast in augmenter loss")
-    p.add_argument("--beta", type=float, default=1.0,
-                   help="Weight of L_rec_aug in augmenter loss")
-    p.add_argument("--cl_temperature", type=float, default=0.07)
-
-    # Evaluation
-    p.add_argument("--ks", type=int, nargs="+", default=[5, 10, 20],
-                   help="Cut-offs for HR@K and NDCG@K")
-
-    # Ablations
-    p.add_argument(
-        "--ablation",
-        type=str,
-        default="full",
-        choices=["full", "intra", "inter", "fixed_lambda", "no_adv"],
-        help=(
-            "full:         complete ASTAR model\n"
-            "intra:        T operates on own sequence only (K=0)\n"
-            "inter:        T operates on other sequences only (no own sequence)\n"
-            "fixed_lambda: λ fixed at 0.5, not learned\n"
-            "no_adv:       no adversarial game, T trained cooperatively"
-        ),
-    )
-
-    # Misc
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--device", type=str, default="auto",
-                   help="'auto', 'cpu', 'cuda', 'cuda:0', etc.")
-    p.add_argument("--num_workers", type=int, default=4)
-    p.add_argument("--save_dir", type=str, default="checkpoints")
-    p.add_argument("--plot_dir", type=str, default="plots")
-    p.add_argument("--log_interval", type=int, default=1)
-    p.add_argument("--probe_only", action="store_true",
-                   help="Run continuous-input diagnostic probe and exit")
-    p.add_argument("--visualize_only", action="store_true",
-                   help="Load checkpoint and run visualisations only")
-    p.add_argument("--checkpoint", type=str, default=None,
-                   help="Path to checkpoint to load for evaluation / visualisation")
-    p.add_argument("--verbose", action="store_true", default=True)
-    p.add_argument("--no_verbose", dest="verbose", action="store_false")
-
-    return p.parse_args()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Model builder
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def build_models(args: argparse.Namespace, num_items: int, device: torch.device):
-    """Instantiate recommender and augmenter."""
-    K = 0 if args.ablation == "intra" else args.K
-
-    recommender = SASRec(
-        num_items=num_items,
-        hidden_size=args.hidden_size,
-        max_seq_len=args.max_seq_len,
-        num_heads=args.num_heads,
-        num_layers=args.num_layers,
-        inner_size=args.inner_size,
-        dropout=args.dropout,
-    ).to(device)
-
-    augmenter = ASTARAugmenter(
-        num_items=num_items,
-        hidden_size=args.hidden_size,
-        max_seq_len=args.max_seq_len,
-        num_heads=args.num_heads,
-        num_layers=args.num_layers,
-        inner_size=args.inner_size,
-        dropout=args.dropout,
-        K=K,
-        tau_init=args.tau_init,
-        tau_floor=args.tau_floor,
-        tau_decay=args.tau_decay,
-    ).to(device)
-
-    return recommender, augmenter
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Ablation modifications
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def apply_ablation(args: argparse.Namespace, trainer: AdvAugmentTrainer) -> None:
-    """Patch trainer / augmenter for ablation studies."""
-    if args.ablation == "fixed_lambda":
-        # Monkey-patch the augmenter forward to fix λ at 0.5
-        original_forward = trainer.augmenter.forward
-
-        def fixed_lam_forward(input_ids, lambda_ceiling=0.8):
-            T, pool_ids, lam = original_forward(input_ids, lambda_ceiling)
-            B = input_ids.size(0)
-            fixed = torch.full((B, 1), 0.7, device=input_ids.device)
-            return T, pool_ids, fixed
-
-        trainer.augmenter.forward = fixed_lam_forward
-
-    elif args.ablation == "no_adv":
-        # Cooperative training: augmenter also minimises contrast loss (no negation)
-        original_phase2 = trainer._phase2_aug
-
-        def cooperative_phase2(input_ids, target_pos, target_neg):
-            trainer.recommender.eval()
-            trainer.augmenter.train()
-            trainer.aug_optimizer.zero_grad()
-
-            T, pool_ids, lam = trainer.augmenter(input_ids, trainer.lambda_ceiling)
-            with torch.no_grad():
-                repr_orig = trainer.recommender.get_representation(input_ids=input_ids)
-            pool_emb = trainer.recommender.item_embeddings(pool_ids).detach()
-            org_emb = trainer.recommender.item_embeddings(input_ids).detach()
-            aug_emb = torch.einsum('bpl,bpd->bld', T, pool_emb)
-            mixed = lam.unsqueeze(-1) * aug_emb + (1 - lam.unsqueeze(-1)) * org_emb
-            repr_aug = trainer.recommender.get_representation(inputs_embeds=mixed)
-            L_rec_aug = trainer.recommender.rec_loss(repr_aug, target_pos, target_neg)
-            # Cooperative: minimise contrast (no negation)
-            L_contrast = trainer.nce_loss(repr_orig.detach(), repr_aug)
-            L_A = trainer.beta * L_rec_aug + trainer.alpha * L_contrast
-            L_A.backward()
-            torch.nn.utils.clip_grad_norm_(trainer.augmenter.parameters(), trainer.grad_clip_norm)
-            trainer.aug_optimizer.step()
-            return {
-                "L_rec_aug_A": L_rec_aug.item(),
-                "L_contrast_A": L_contrast.item(),
-                "L_A": L_A.item(),
-                "lambda_mean": lam.mean().item(),
-            }
-
-        trainer._phase2_aug = cooperative_phase2
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def main() -> None:
-    args = parse_args()
-
-    # Device
-    if args.device == "auto":
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = torch.device(args.device)
-    print(f"Using device: {device}")
+def main():
+    args = initialize_parser()
 
     set_seed(args.seed)
+    check_path(args.output_dir)
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
+    args.cuda_condition = torch.cuda.is_available() and not args.no_cuda
+    print("Using Cuda:", torch.cuda.is_available())
+    args.data_file = args.data_dir + args.data_name + '.txt'
 
-    # ── Data ──────────────────────────────────────────────────────────────
-    train_loader, valid_loader, test_loader, num_users, num_items = build_dataloaders(
-        data_path=args.data_path,
-        max_seq_len=args.max_seq_len,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        seed=args.seed,
+    user_seq, max_item, valid_rating_matrix, test_rating_matrix = \
+        get_user_seqs(args.data_file)
+
+    args.item_size = max_item + 2
+    args.mask_id = 0
+    args.model_idx = 111
+    args_str = f'{args.model_name}-{args.data_name}-{args.model_idx}'
+    args.log_file = os.path.join(args.output_dir, args_str + '.txt')
+
+    show_args_info(args)
+
+    with open(args.log_file, 'a') as f:
+        f.write(str(args) + '\n')
+
+    args.train_matrix = valid_rating_matrix
+    checkpoint = args_str + '.pt'
+    args.checkpoint_path = os.path.join(args.output_dir, checkpoint)
+
+    # -----------   datasets  --------- #
+    train_dataset = RecWithContrastiveLearningDataset(
+        args, user_seq[:int(len(user_seq) * args.training_data_ratio)], data_type='train')
+    train_sampler = RandomSampler(train_dataset)
+    train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.batch_size)
+
+    eval_dataset = RecWithContrastiveLearningDataset(args, user_seq, data_type='valid')
+    eval_sampler = SequentialSampler(eval_dataset)
+    eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.batch_size)
+
+    test_dataset = RecWithContrastiveLearningDataset(args, user_seq, data_type='test')
+    test_sampler = SequentialSampler(test_dataset)
+    test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=args.batch_size)
+
+    # -----------   models  --------- #
+    model = SASRecModel(args=args)
+    adv_model = ASTARAugmenter(
+        num_items=args.item_size,
+        hidden_size=args.hidden_size,
+        max_seq_len=args.max_seq_length,
+        num_heads=args.num_attention_heads,
+        num_layers=args.num_hidden_layers,
+        inner_size=args.hidden_size * 4,
+        dropout=args.hidden_dropout_prob,
+        K=4,
+        tau_init=args.mask_tau,
+        tau_floor=1.0,
+        tau_decay=0.99,
     )
-    print(f"Dataset: {args.dataset}  |  users={num_users}  items={num_items}")
-    print(f"  train={len(train_loader.dataset)}  valid={len(valid_loader.dataset)}  test={len(test_loader.dataset)}")
 
-    # ── Models ────────────────────────────────────────────────────────────
-    recommender, augmenter = build_models(args, num_items, device)
-    print(f"Recommender params: {sum(p.numel() for p in recommender.parameters()):,}")
-    print(f"Augmenter params:   {sum(p.numel() for p in augmenter.parameters()):,}")
+    # -----------   diagnostics  --------- #
+    diag = GANDiagnostics(window_size=50)
+    probe_batch = next(iter(train_dataloader))
+    _, probe_ids, _, _, _ = probe_batch[0]
+    diag.register_probe(probe_ids)
 
-    # Load checkpoint if provided
-    if args.checkpoint:
-        ckpt = torch.load(args.checkpoint, map_location=device)
-        recommender.load_state_dict(ckpt["recommender"])
-        if "augmenter" in ckpt:
-            augmenter.load_state_dict(ckpt["augmenter"])
-        print(f"Loaded checkpoint: {args.checkpoint}")
-
-    # ── Diagnostic probe ──────────────────────────────────────────────────
-    if args.probe_only:
-        batch = next(iter(train_loader))
-        input_ids = batch["input_ids"].to(device)
-        probe_continuous_input(recommender, input_ids, device, L=args.max_seq_len)
-        return
-
-    # ── Visualise only ────────────────────────────────────────────────────
-    if args.visualize_only:
-        plot_dir = os.path.join(args.plot_dir, args.dataset)
-        visualize_T(augmenter, test_loader, device,
-                    save_path=os.path.join(plot_dir, "T_heatmap.png"))
-        visualize_lambda(augmenter, test_loader, device,
-                         save_path=os.path.join(plot_dir, "lambda_dist.png"))
-        intra, inter = compute_intra_inter_ratio(augmenter, test_loader, device)
-        print(f"Intra: {intra:.4f}  Inter: {inter:.4f}")
-        return
-
-    # ── Optimisers ────────────────────────────────────────────────────────
-    rec_optimizer = torch.optim.Adam(
-        recommender.parameters(),
-        lr=args.rec_lr,
-        weight_decay=args.weight_decay,
-    )
-    aug_optimizer = torch.optim.Adam(
-        augmenter.parameters(),
-        lr=args.aug_lr,
-        weight_decay=args.weight_decay,
-    )
-
-    # ── Trainer ───────────────────────────────────────────────────────────
-    save_dir = os.path.join(args.save_dir, args.dataset, args.ablation)
+    # -----------   trainer  --------- #
     trainer = AdvAugmentTrainer(
-        recommender=recommender,
-        augmenter=augmenter,
-        rec_optimizer=rec_optimizer,
-        aug_optimizer=aug_optimizer,
-        device=device,
-        gamma=args.gamma,
-        lambda_cl=args.lambda_cl,
-        alpha=args.alpha,
-        beta=args.beta,
-        cl_temperature=args.cl_temperature,
-        warmup_epochs=args.warmup_epochs,
+        model, adv_model,
+        train_dataloader,
+        eval_dataloader,
+        test_dataloader,
+        args,
+        diagnostics=diag
     )
 
-    # Apply ablation patches
-    apply_ablation(args, trainer)
+    if args.do_eval:
+        trainer.args.train_matrix = test_rating_matrix
+        trainer.load(args.checkpoint_path)
+        print(f'Load model from {args.checkpoint_path} for test!')
+        scores, result_info = trainer.test(0, full_sort=True)
 
-    # ── Run diagnostic probe before training ──────────────────────────────
-    sample_batch = next(iter(train_loader))
-    sample_ids = sample_batch["input_ids"].to(device)
-    probe_result = probe_continuous_input(recommender, sample_ids, device, L=args.max_seq_len)
+    else:
+        print(f'Train CoSeRec')
+        early_stopping = EarlyStopping(args.checkpoint_path, patience=40, verbose=True)
 
-    # ── Train ─────────────────────────────────────────────────────────────
-    test_metrics = trainer.fit(
-        train_loader=train_loader,
-        valid_loader=valid_loader,
-        test_loader=test_loader,
-        num_epochs=args.num_epochs,
-        patience=args.patience,
-        save_dir=save_dir,
-        verbose=args.verbose,
-        log_interval=args.log_interval,
-    )
+        for epoch in range(args.epochs):
+            trainer.train(epoch)
+            scores, _ = trainer.valid(epoch, full_sort=True)
+            early_stopping(np.array(scores[-1:]), trainer.model)
+            if early_stopping.early_stop:
+                print("Early stopping")
+                break
 
-    # ── Save results ──────────────────────────────────────────────────────
-    results = {
-        "dataset": args.dataset,
-        "ablation": args.ablation,
-        "seed": args.seed,
-        "probe": probe_result,
-        "test_metrics": test_metrics,
-        "args": vars(args),
-    }
-    os.makedirs(save_dir, exist_ok=True)
-    result_path = os.path.join(save_dir, "results.json")
-    with open(result_path, "w") as f:
-        json.dump(results, f, indent=2)
-    print(f"\nResults saved → {result_path}")
+        # Plot diagnostics at end of training
+        diag.plot('diagnostics.png')
 
-    # ── Visualisations ────────────────────────────────────────────────────
-    plot_dir = os.path.join(args.plot_dir, args.dataset, args.ablation)
-    try:
-        visualize_T(augmenter, test_loader, device,
-                    save_path=os.path.join(plot_dir, "T_heatmap.png"))
-        visualize_lambda(augmenter, test_loader, device,
-                         save_path=os.path.join(plot_dir, "lambda_dist.png"))
-    except Exception as exc:
-        print(f"[warn] Visualisation failed: {exc}")
+        trainer.args.train_matrix = test_rating_matrix
+        print('---------------Change to test_rating_matrix!-------------------')
+        trainer.model.load_state_dict(torch.load(args.checkpoint_path))
+        scores, result_info = trainer.test(0, full_sort=True)
 
+    print(args_str)
+    print(result_info)
+    with open(args.log_file, 'a') as f:
+        f.write(args_str + '\n')
+        f.write(result_info + '\n')
 
-if __name__ == "__main__":
-    main()
+main()
