@@ -374,12 +374,12 @@ class ASTARv2Augmenter(ASTARAugmenter):
             input_ids: [B, L]     original sequence (for padding mask)
 
         Returns:
-            aug_seq: [B, L]  long tensor of selected item ids
+            aug_seq: [B, L]  long tensor of selected item ids (0 at padding)
         """
         pool_idx = T.argmax(dim=1)                                      # [B, L]
         aug_seq = pool_ids.gather(1, pool_idx)                          # [B, L]
-        pad_mask = (input_ids > 0).long()
-        return aug_seq * pad_mask                                        # zero-out padding
+        pad_mask = (input_ids > 0)
+        return torch.where(pad_mask, aug_seq, torch.zeros_like(aug_seq))
 
     @staticmethod
     def _transport_reg(

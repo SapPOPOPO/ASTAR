@@ -88,8 +88,9 @@ def initialize_parser():
     parser.add_argument('--run_id', default=None, type=str)
     # Warmup: number of epochs before adversarial augmenter updates begin
     parser.add_argument("--warmup_epochs", type=int, default=10,
-                        help="Epochs of recommender-only warmup before adversarial "
-                             "augmenter updates start (ASTAR and CoSeRec paths).")
+                        help="Number of recommender-only warmup epochs. "
+                             "Adversarial augmenter updates start at epoch warmup_epochs+1 "
+                             "(ASTAR and CoSeRec paths).")
     # ASTARv2 ablation-specific args
     parser.add_argument("--v2_cl_weight", type=float, default=0.2,
                         help="Weight for view-to-view contrastive loss in ASTARv2.")

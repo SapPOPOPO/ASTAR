@@ -253,8 +253,9 @@ class AdvAugmentTrainer(Trainer):
                 # carries gradient back through probs → logits → augmenter.
                 min_rate = 0.3
                 max_rate = 0.7
-                aug_rate1 = (probs1 * pad_mask).sum(dim=1) / seq_lengths.clamp(min=1)
-                aug_rate2 = (probs2 * pad_mask).sum(dim=1) / seq_lengths.clamp(min=1)
+                pad_mask_f = pad_mask.float()
+                aug_rate1 = (probs1 * pad_mask_f).sum(dim=1) / seq_lengths.clamp(min=1)
+                aug_rate2 = (probs2 * pad_mask_f).sum(dim=1) / seq_lengths.clamp(min=1)
                 rate_penalty = (
                     torch.clamp(min_rate - aug_rate1, min=0) +
                     torch.clamp(aug_rate1 - max_rate, min=0) +
@@ -267,7 +268,8 @@ class AdvAugmentTrainer(Trainer):
                     torch.abs(aug_rate1 - aug_rate2) - 0.3, min=0
                 ).mean()
 
-                if epoch >= self.args.warmup_epochs:
+                # Augmenter updates start after warmup_epochs complete recommender-only epochs
+                if epoch > self.args.warmup_epochs:
                     loss_A = (self.beta_w  * rec_loss_aug_A
                             - self.alpha   * contrast_loss_A
                             - self.eta     * entropy
@@ -462,17 +464,18 @@ class CoSeRecTrainer(Trainer):
 
                 masks1, masks2, probs1, probs2, _ = self.adv_model.sample_masks(
                     input_ids, tau=tau, hard=False, return_probs=True)
-                avg_prob1 = masks1.sum(dim=1) / seq_lengths.clamp(min=1)
-                avg_prob2 = masks2.sum(dim=1) / seq_lengths.clamp(min=1)
+                avg_prob1 = masks1.float().sum(dim=1) / seq_lengths.clamp(min=1)
+                avg_prob2 = masks2.float().sum(dim=1) / seq_lengths.clamp(min=1)
 
                 similarity_penalty = self._one_pair_contrastive_learning([modified_seq1, modified_seq2])
                 reg_loss = (((avg_prob1 - self.target_rate) ** 2).mean() +
                             ((avg_prob2 - self.target_rate) ** 2).mean())
 
-                if i == 2 and epoch >= self.args.warmup_epochs:
+                if i == 2 and epoch > self.args.warmup_epochs:
                     print(masks1, masks2, modified_seq1, modified_seq2)
 
-                if epoch >= self.args.warmup_epochs:
+                # Augmenter updates start after warmup_epochs complete recommender-only epochs
+                if epoch > self.args.warmup_epochs:
                     adv_model_loss = (modified_rec_loss
                                     - self.args.penalty_weight * similarity_penalty
                                     + self.args.reg_weight * reg_loss)
@@ -665,7 +668,8 @@ class ASTARv2Trainer(Trainer):
                 self.optim_model.step()
 
                 # ── Update Augmenter (A), after warmup ───────────────────────
-                if epoch >= self.args.warmup_epochs:
+                # Augmenter updates start after warmup_epochs complete recommender-only epochs
+                if epoch > self.args.warmup_epochs:
                     # Re-run with grad to get differentiable reg_loss
                     _, _, reg_loss = self.adv_model.generate_views(input_ids)
 
