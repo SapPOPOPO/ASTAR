@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-
 import os
 import numpy as np
 import random
@@ -7,9 +5,10 @@ import torch
 import argparse
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from datasets import RecWithContrastiveLearningDataset
-from trainers import CoSeRecTrainer, AdvAugmentTrainer
+from trainers import CoSeRecTrainer, AdvAugmentTrainer, ASTARv2Trainer
 from recommender import SASRecModel
-from ASTAR import ASTARAugmenter
+from augmenter import Augmenter
+from ASTAR import ASTARv2Augmenter
 from utils import EarlyStopping, get_user_seqs, get_item2attribute_json, check_path, set_seed
 from diagnose import GANDiagnostics
 
@@ -87,6 +86,19 @@ def initialize_parser():
     parser.add_argument("--target_rate", type=float, default=0.5)
     parser.add_argument("--ratio", type=float, default=0.7)
     parser.add_argument('--run_id', default=None, type=str)
+    # Warmup: number of epochs before adversarial augmenter updates begin
+    parser.add_argument("--warmup_epochs", type=int, default=10,
+                        help="Epochs of recommender-only warmup before adversarial "
+                             "augmenter updates start (ASTAR and CoSeRec paths).")
+    # ASTARv2 ablation-specific args
+    parser.add_argument("--v2_cl_weight", type=float, default=0.2,
+                        help="Weight for view-to-view contrastive loss in ASTARv2.")
+    parser.add_argument("--transport_reg_weight", type=float, default=0.1,
+                        help="Weight for transport entropy+balance regularisation "
+                             "in ASTARv2 augmenter update.")
+    parser.add_argument("--transport_K", type=int, default=4,
+                        help="Number of inter-sequence samples K for transport pool "
+                             "in ASTARv2 (pool size = (1+K)*max_seq_length).")
 
     args = parser.parse_args()
     return args
@@ -136,35 +148,61 @@ def main():
 
     # -----------   models  --------- #
     model = SASRecModel(args=args)
-    adv_model = ASTARAugmenter(
-        num_items=args.item_size,
-        hidden_size=args.hidden_size,
-        max_seq_len=args.max_seq_length,
-        num_heads=args.num_attention_heads,
-        num_layers=args.num_hidden_layers,
-        inner_size=args.hidden_size * 4,
-        dropout=args.hidden_dropout_prob,
-        K=4,
-        tau_init=args.mask_tau,
-        tau_floor=1.0,
-        tau_decay=0.99,
-    )
 
-    # -----------   diagnostics  --------- #
-    diag = GANDiagnostics(window_size=50)
-    probe_batch = next(iter(train_dataloader))
-    _, probe_ids, _, _, _ = probe_batch[0]
-    diag.register_probe(probe_ids)
+    if args.model_name == 'ASTARv2':
+        # ── ASTARv2: dual-view transport ablation ────────────────────────────
+        adv_model = ASTARv2Augmenter(
+            num_items=args.item_size,
+            hidden_size=args.hidden_size,
+            max_seq_len=args.max_seq_length,
+            num_heads=args.num_attention_heads,
+            num_layers=args.num_hidden_layers,
+            inner_size=args.hidden_size * 4,
+            dropout=args.hidden_dropout_prob,
+            K=args.transport_K,
+            tau_init=args.mask_tau,
+            tau_floor=1.0,
+            tau_decay=0.99,
+        )
 
-    # -----------   trainer  --------- #
-    trainer = AdvAugmentTrainer(
-        model, adv_model,
-        train_dataloader,
-        eval_dataloader,
-        test_dataloader,
-        args,
-        diagnostics=diag
-    )
+        # -----------   trainer  --------- #
+        trainer = ASTARv2Trainer(
+            model, adv_model,
+            train_dataloader, eval_dataloader, test_dataloader,
+            args,
+        )
+
+    elif args.model_name == 'ASTAR':
+        # ── ASTAR: adversarial mask-based augmentation (bugfixed) ────────────
+        adv_model = Augmenter(args)
+
+        diag = GANDiagnostics(window_size=50)
+        probe_batch = next(iter(train_dataloader))
+        _, probe_ids, _, _, _ = probe_batch[0]
+        diag.register_probe(probe_ids)
+
+        trainer = AdvAugmentTrainer(
+            model, adv_model,
+            train_dataloader, eval_dataloader, test_dataloader,
+            args,
+            diagnostics=diag,
+        )
+
+    else:
+        # ── CoSeRec (default) ────────────────────────────────────────────────
+        adv_model = Augmenter(args)
+
+        diag = GANDiagnostics(window_size=50)
+        probe_batch = next(iter(train_dataloader))
+        _, probe_ids, _, _, _ = probe_batch[0]
+        diag.register_probe(probe_ids)
+
+        trainer = CoSeRecTrainer(
+            model, adv_model,
+            train_dataloader, eval_dataloader, test_dataloader,
+            args,
+            diagnostics=diag,
+        )
 
     if args.do_eval:
         trainer.args.train_matrix = test_rating_matrix
@@ -173,7 +211,7 @@ def main():
         scores, result_info = trainer.test(0, full_sort=True)
 
     else:
-        print(f'Train CoSeRec')
+        print(f'Train {args.model_name}')
         early_stopping = EarlyStopping(args.checkpoint_path, patience=40, verbose=True)
 
         for epoch in range(args.epochs):
@@ -184,8 +222,9 @@ def main():
                 print("Early stopping")
                 break
 
-        # Plot diagnostics at end of training
-        diag.plot('diagnostics.png')
+        # Plot diagnostics (ASTAR / CoSeRec paths only)
+        if args.model_name != 'ASTARv2':
+            diag.plot('diagnostics.png')
 
         trainer.args.train_matrix = test_rating_matrix
         print('---------------Change to test_rating_matrix!-------------------')

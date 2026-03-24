@@ -1,18 +1,15 @@
 """
-augmenter.py — ASTAR adversarial augmenter.
+ASTAR.py — ASTAR adversarial transport augmenters.
 
-Implements:
+ASTARAugmenter:
     - Unified intra + inter sequence transformation matrix T
     - Adaptive blend weight λ
     - Masked softmax over real (non-padding) pool positions
-    - Own item embeddings (used for context encoding only, not for output)
 
-T shape: [B, P, L] where P = (1+K)*L
-    - rows = pool positions (source), columns = output positions (target)
-    - softmax over dim=1 (each column sums to 1)
-
-forward() returns: T [B, P, L], pool_ids [B, P], lam [B, 1]
-    Embedding lookup and λ-blending happen inside the recommender.
+ASTARv2Augmenter (subclass):
+    - Dual T_heads producing two independent augmented views
+    - View-to-view contrastive learning compatible interface
+    - Entropy + usage-balance regularization to prevent transport collapse
 """
 
 from typing import Optional, Tuple
@@ -22,6 +19,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from modules import Encoder, LayerNorm
+
+
+class _EncArgs:
+    """Minimal args namespace for constructing modules.Encoder."""
+
+    def __init__(self, hidden_size: int, num_heads: int, num_layers: int, dropout: float) -> None:
+        self.hidden_size = hidden_size
+        self.num_attention_heads = num_heads
+        self.num_hidden_layers = num_layers
+        self.hidden_act = "gelu"
+        self.attention_probs_dropout_prob = dropout
+        self.hidden_dropout_prob = dropout
+        self.initializer_range = 0.02
 
 
 class ASTARAugmenter(nn.Module):
@@ -68,7 +78,9 @@ class ASTARAugmenter(nn.Module):
         self.emb_norm = LayerNorm(hidden_size)
 
         # ── Sequence encoder ─────────────────────────────────────────────────
-        self.encoder = Encoder(hidden_size, num_heads, num_layers, inner_size, dropout)
+        # Build an args-compatible namespace so we can reuse modules.Encoder
+        _enc_args = _EncArgs(hidden_size, num_heads, num_layers, dropout)
+        self.encoder = Encoder(_enc_args)
         self.enc_norm = LayerNorm(hidden_size)
 
         # ── T head: h [B, L, D] → logits [B, L, P], transposed to [B, P, L] ─
@@ -127,7 +139,15 @@ class ASTARAugmenter(nn.Module):
         emb = self.emb_norm(self.emb_dropout(emb))
 
         pad_mask = (input_ids > 0).long()  # [B, L]
-        hidden = self.encoder(emb, pad_mask)
+
+        # Build attention mask in the format expected by modules.Encoder:
+        # shape [B, 1, 1, L], with -10000 for padding positions.
+        att_mask = pad_mask.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, L]
+        att_mask = att_mask.to(dtype=emb.dtype)
+        att_mask = (1.0 - att_mask) * -10000.0
+
+        all_layers = self.encoder(emb, att_mask, output_all_encoded_layers=False)
+        hidden = all_layers[-1]  # [B, L, D]
         hidden = self.enc_norm(hidden)
         return hidden, pad_mask
 
@@ -257,3 +277,150 @@ class ASTARAugmenter(nn.Module):
         mask_f = mask.float().unsqueeze(-1)  # [B, L, 1]
         lengths = mask_f.sum(1).clamp(min=1)  # [B, 1]
         return (h * mask_f).sum(1) / lengths  # [B, D]
+
+
+class ASTARv2Augmenter(ASTARAugmenter):
+    """Dual-view transport augmenter for the ASTARv2 ablation.
+
+    Extends ASTARAugmenter with a second transformation head (T_head2) so
+    that two independent augmented views can be generated from a single
+    encoded representation.  The views are used in a view-to-view
+    contrastive learning objective while entropy + usage-balance
+    regularisation on the transport matrices prevents collapse.
+
+    Key methods
+    -----------
+    generate_views(input_ids) → (aug_seq1, aug_seq2, reg_loss)
+        Returns two discrete augmented sequences and a scalar regularisation
+        term that carries gradient back to T_head / T_head2.
+    """
+
+    def __init__(
+        self,
+        num_items: int,
+        hidden_size: int = 256,
+        max_seq_len: int = 50,
+        num_heads: int = 2,
+        num_layers: int = 2,
+        inner_size: int = 512,
+        dropout: float = 0.1,
+        K: int = 4,
+        tau_init: float = 10.0,
+        tau_floor: float = 1.0,
+        tau_decay: float = 0.99,
+    ) -> None:
+        super().__init__(
+            num_items, hidden_size, max_seq_len, num_heads, num_layers,
+            inner_size, dropout, K, tau_init, tau_floor, tau_decay,
+        )
+        pool_size = (1 + K) * max_seq_len
+        self.T_head2 = nn.Linear(hidden_size, pool_size, bias=True)
+        nn.init.normal_(self.T_head2.weight, std=0.02)
+        nn.init.zeros_(self.T_head2.bias)
+
+    # ── dual-view interface ───────────────────────────────────────────────────
+
+    def generate_views(
+        self, input_ids: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Generate two augmented views and a transport regularisation loss.
+
+        Args:
+            input_ids: [B, L]  item ids (0 = padding)
+
+        Returns:
+            aug_seq1: [B, L]  first discrete augmented sequence
+            aug_seq2: [B, L]  second discrete augmented sequence
+            reg_loss: scalar  transport reg (entropy + usage-balance) with grad
+        """
+        h, own_mask = self._encode(input_ids)
+
+        # Build pool: own sequence + K sampled sequences
+        sampled_ids = self._sample_inter_sequences(input_ids)          # [B, K*L]
+        pool_ids = torch.cat([input_ids, sampled_ids], dim=1)          # [B, P]
+        others_mask = (sampled_ids > 0).long()
+        pool_mask = torch.cat([own_mask, others_mask], dim=1)          # [B, P]
+
+        # View 1: T_head (inherited)
+        T1_logits = self.T_head(h).transpose(1, 2)                     # [B, P, L]
+        T1 = self._masked_softmax(T1_logits, pool_mask)
+
+        # View 2: T_head2
+        T2_logits = self.T_head2(h).transpose(1, 2)                    # [B, P, L]
+        T2 = self._masked_softmax(T2_logits, pool_mask)
+
+        # Hard argmax → discrete sequences (no gradient through indices)
+        aug_seq1 = self._argmax_select(T1, pool_ids, input_ids)        # [B, L]
+        aug_seq2 = self._argmax_select(T2, pool_ids, input_ids)        # [B, L]
+
+        # Regularisation: carries gradient back through T1 and T2
+        reg_loss = self._transport_reg(T1, T2, pool_mask)
+
+        return aug_seq1, aug_seq2, reg_loss
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _argmax_select(
+        T: torch.Tensor,
+        pool_ids: torch.Tensor,
+        input_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Select items from pool via argmax over the pool dimension.
+
+        Args:
+            T:         [B, P, L]  transport matrix (softmax over dim=1)
+            pool_ids:  [B, P]     item ids of the pool
+            input_ids: [B, L]     original sequence (for padding mask)
+
+        Returns:
+            aug_seq: [B, L]  long tensor of selected item ids
+        """
+        pool_idx = T.argmax(dim=1)                                      # [B, L]
+        aug_seq = pool_ids.gather(1, pool_idx)                          # [B, L]
+        pad_mask = (input_ids > 0).long()
+        return aug_seq * pad_mask                                        # zero-out padding
+
+    @staticmethod
+    def _transport_reg(
+        T1: torch.Tensor,
+        T2: torch.Tensor,
+        pool_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Entropy + usage-balance regularisation on transport matrices.
+
+        Maximising column-wise entropy prevents the augmenter from always
+        selecting the same pool position for each output slot.
+        Minimising usage-imbalance encourages all pool positions to be used.
+
+        Both terms have gradient through T1 and T2.
+
+        Args:
+            T1, T2:    [B, P, L]  transport matrices (each column sums to 1)
+            pool_mask: [B, P]     1 for real pool positions, 0 for padding
+
+        Returns:
+            scalar regularisation loss (lower is better)
+        """
+        eps = 1e-10
+
+        # ── Column-wise entropy: H(T[:, :, j]) = -Σ_i T[i,j]*log(T[i,j]) ──
+        ent1 = -(T1 * (T1 + eps).log()).sum(dim=1)  # [B, L]
+        ent2 = -(T2 * (T2 + eps).log()).sum(dim=1)  # [B, L]
+        # Negate: we want to maximise entropy, so minimise negative entropy
+        entropy_loss = -(ent1.mean() + ent2.mean()) / 2.0
+
+        # ── Usage balance: each pool position should be used uniformly ────────
+        # Row-wise mean over output positions gives average usage per pool pos
+        usage1 = T1.mean(dim=2)                                         # [B, P]
+        usage2 = T2.mean(dim=2)                                         # [B, P]
+        mask_f = pool_mask.float()                                       # [B, P]
+        n_valid = mask_f.sum(dim=1, keepdim=True).clamp(min=1)          # [B, 1]
+        uniform = mask_f / n_valid                                       # [B, P]
+
+        # KL(uniform ‖ usage): penalise under-used pool positions
+        kl1 = (uniform * (uniform / (usage1 + eps)).log() * mask_f).sum(dim=1).mean()
+        kl2 = (uniform * (uniform / (usage2 + eps)).log() * mask_f).sum(dim=1).mean()
+        balance_loss = (kl1 + kl2) / 2.0
+
+        return entropy_loss + balance_loss

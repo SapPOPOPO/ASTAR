@@ -272,6 +272,8 @@ class Augmenter(nn.Module):
     #         return masks1, masks2, pad_mask
 
     def sample_masks(self, input_ids, tau=None, hard=True, return_probs=True, deterministic=False):
+        # Fall back to the module's current tau if none is supplied
+        tau = tau if tau is not None else self.tau
         pad_mask = input_ids > 0
         logit1, logit2 = self.get_dual_mask_logits(input_ids)
         
@@ -431,3 +433,9 @@ class Augmenter(nn.Module):
 
     def decay_tau(self):
         self.tau = max(self.tau * self.tau_decay, self.min_tau)
+
+    def modify_sequence(self, input_ids, tau=None):
+        """Return (aug_seq1, aug_seq2, probs1, probs2) — compatibility alias for forward()."""
+        aug_seq1, aug_seq2, probs1, probs2, _masks1, _masks2, _pad_mask = \
+            self.forward(input_ids, tau=tau)
+        return aug_seq1, aug_seq2, probs1, probs2
